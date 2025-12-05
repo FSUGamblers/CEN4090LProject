@@ -89,7 +89,7 @@ export async function setupAuth(app: Express) {
       (req as any).isAuthenticated = () => true;
       const exp = Math.floor(Date.now() / 1000) + 60 * 60; // 1 hour
       (req as any).user = {
-        claims: { sub: "dev-user", email: "dev@example.com", exp },
+        claims: { sub: "dev-user", email: "maccollins44@gmail.com", exp },
         access_token: "dev",
         refresh_token: null,
         expires_at: exp,
@@ -101,8 +101,8 @@ export async function setupAuth(app: Express) {
     app.get("/api/login", (_req, res) => res.redirect("/"));
     app.get("/api/auth/user", (_req, res) => res.json({
       id: "dev-user",
-      email: "dev@example.com",
-      name: "Dev Demo",
+      email: "maccollins44@gmail.com",
+      name: "Mac Collins",
       expires_at: Math.floor(Date.now() / 1000) + 3600,
     }));
     app.post("/api/logout", (_req, res) => res.status(204).end());
