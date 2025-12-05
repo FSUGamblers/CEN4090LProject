@@ -12,8 +12,6 @@ import Analytics from "@/pages/Analytics";
 import Lines from "@/pages/Lines";
 import PnL from "@/pages/PnL";
 import Jobs from "@/pages/Jobs";
-import Admin from "@/pages/Admin";
-import AuditLogs from "@/pages/AuditLogs";
 import Layout from "@/components/Layout";
 import NotFound from "@/pages/not-found";
 
@@ -33,8 +31,6 @@ function Router() {
           <Route path="/lines" component={Lines} />
           <Route path="/pnl" component={PnL} />
           <Route path="/jobs" component={Jobs} />
-          <Route path="/admin" component={Admin} />
-          <Route path="/audit-logs" component={AuditLogs} />
         </Layout>
       )}
       <Route component={NotFound} />
