@@ -4,43 +4,75 @@ import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
-import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
 import { Badge } from "@/components/ui/badge";
 import { Separator } from "@/components/ui/separator";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import ArbitrageCard from "@/components/ArbitrageCard";
 import { useToast } from "@/hooks/use-toast";
 import { apiRequest } from "@/lib/queryClient";
-import { Search, Filter, TrendingUp, Clock, AlertTriangle, Crown, CreditCard } from "lucide-react";
+import {
+  Search,
+  Filter,
+  TrendingUp,
+  Clock,
+  AlertTriangle,
+  Crown,
+  CreditCard,
+} from "lucide-react";
 import type { ArbitrageOpportunityDisplay } from "@/types";
 
-/* -------------------- Types (same as before) -------------------- */
+/* -------------------- Types -------------------- */
 interface ScanRequest {
   states: string[];
   sports?: string[];
   regions?: string[];
   markets?: string[];
   minProfitPct?: number;
+  useCachedOdds?: boolean; 
 }
 
+
+/**
+ * IMPORTANT: In the agent response, each leg's `stake` is in basis points of
+ * some notional bankroll (e.g., 5000 = 50% of bankroll).
+ * We normalize that into `stakeBps` for display as "% of bankroll".
+ */
 interface MaxProfitPick {
-  eventId: string;
-  marketId: string;
+  eventId?: string;
+  marketId?: string;
+  eventName?: string;
+  marketType?: string;
+  description?: string;
   legs: Array<{
     outcome: string;
     sportsbook: string;
     odds: string;
-    stake: number;
+    // basis points of bankroll: 5000 -> 50% of bankroll
+    stakeBps: number;
   }>;
+  // Expected locked profit as a percentage of bankroll (e.g., 1.5 = 1.5%)
   expectedProfitPct: number;
-  recommendedStakes: { [outcome: string]: number };
+  // Confidence already normalized to 0–100 (we will display as "%")
   confidenceScore: number;
 }
 
 interface ArbitrageScanResult {
   success: boolean;
   maxProfitPick?: MaxProfitPick;
+  /**
+   * All opportunities returned by the scan, already ranked by edge/safety.
+   * We mirror `rankedOpportunities` from the backend so the UI always has
+   * a consistent list to work with.
+   */
   allOpportunities: ArbitrageOpportunityDisplay[];
+  rankedOpportunities: ArbitrageOpportunityDisplay[];
   creditUsage: {
     requestsUsed: number;
     creditsConsumed: number;
@@ -48,17 +80,95 @@ interface ArbitrageScanResult {
   cacheExpiresAt: string;
 }
 
+/* -------------------- Normalization helpers -------------------- */
+
+function normalizeConfidence(raw: unknown): number {
+  const num = typeof raw === "number" ? raw : Number(raw);
+  if (!Number.isFinite(num) || num <= 0) return 0;
+
+  // Cases:
+  //  - 0–1  -> treat as probability, convert to %
+  //  - 1–100 -> already a percent
+  //  - >100  -> assume basis points style (e.g. 9500 -> 95%), clamp to 100
+  if (num <= 1) return num * 100;
+  if (num <= 100) return num;
+  return Math.min(100, num / 100);
+}
+
+function normalizeMaxProfitPick(raw: any | undefined | null): MaxProfitPick | undefined {
+  if (!raw) return undefined;
+
+  // Profit: prefer expectedProfitPct, fall back to profitPct/bestProfitPct
+  const profitSource =
+    typeof raw.expectedProfitPct === "number"
+      ? raw.expectedProfitPct
+      : typeof raw.profitPct === "number"
+      ? raw.profitPct
+      : typeof raw.bestProfitPct === "number"
+      ? raw.bestProfitPct
+      : 0;
+
+  const expectedProfitPct = Number.isFinite(profitSource) ? Number(profitSource) : 0;
+
+  const legs = Array.isArray(raw.legs)
+    ? raw.legs.map((leg: any) => ({
+        outcome: String(leg.outcome ?? leg.label ?? leg.outcomeLabel ?? ""),
+        sportsbook: String(leg.sportsbook ?? leg.book ?? leg.bookName ?? ""),
+        odds:
+          typeof leg.odds === "number"
+            ? leg.odds.toString()
+            : String(leg.odds ?? ""),
+        // Treat raw `stake` as basis points of bankroll if provided,
+        // otherwise fall back to any existing stakeBps-like field.
+        stakeBps: Number(leg.stake ?? leg.stakeBps ?? 0),
+      }))
+    : [];
+
+  const confidenceScore = normalizeConfidence(raw.confidenceScore);
+
+  return {
+    eventId: raw.eventId ?? raw.event?.id,
+    marketId: raw.marketId ?? raw.market?.id ?? raw.marketType,
+    eventName:
+      raw.eventName ??
+      raw.event?.name ??
+      (raw.event?.homeTeam && raw.event?.awayTeam
+        ? `${raw.event.homeTeam} vs ${raw.event.awayTeam}`
+        : undefined),
+    marketType: raw.marketType ?? raw.market?.type,
+    description: raw.market?.description ?? raw.description,
+    legs,
+    expectedProfitPct,
+    confidenceScore,
+  };
+}
+
 /* -------------------- Agent bridge -------------------- */
 /** Normalizes any agent response shape into ArbitrageScanResult */
 function normalizeAgentResult(payload: any): ArbitrageScanResult {
-  // Agent might return { result: {...} } or the result at top-level.
+  // Backend returns the result at the top-level; keep support for { result: {...} } too.
   const root = payload?.result ?? payload ?? {};
-  const opportunities: ArbitrageOpportunityDisplay[] =
-    root.allOpportunities ?? root.opportunities ?? [];
 
-  const creditUsage = root.creditUsage ?? {
-    requestsUsed: Number(root.requestsUsed ?? 0) || 0,
-    creditsConsumed: Number(root.creditsConsumed ?? 0) || 0,
+  const maxProfitPick = normalizeMaxProfitPick(
+    root.maxProfitPick ?? root.bestOpportunity ?? root.topOpportunity
+  );
+
+  // Prefer the new backend field `rankedOpportunities`, but still support
+  // older shapes (`allOpportunities` / `opportunities`) for flexibility.
+  const rawList =
+    root.rankedOpportunities ??
+    root.allOpportunities ??
+    root.opportunities ??
+    [];
+
+  const normalizedList: ArbitrageOpportunityDisplay[] = Array.isArray(rawList)
+    ? (rawList as ArbitrageOpportunityDisplay[])
+    : [];
+
+  const creditUsage = {
+    requestsUsed: Number(root.creditUsage?.requestsUsed ?? root.requestsUsed ?? 0) || 0,
+    creditsConsumed:
+      Number(root.creditUsage?.creditsConsumed ?? root.creditsConsumed ?? 0) || 0,
   };
 
   const cacheExpiresAt: string =
@@ -67,32 +177,44 @@ function normalizeAgentResult(payload: any): ArbitrageScanResult {
       : new Date(Date.now() + 5 * 60 * 1000).toISOString(); // default 5m
 
   return {
-    success: !!(payload?.success ?? true),
-    maxProfitPick: root.maxProfitPick,
-    allOpportunities: opportunities,
+    success: typeof payload?.success === "boolean" ? payload.success : true,
+    maxProfitPick,
+    allOpportunities: normalizedList,
+    rankedOpportunities: normalizedList,
     creditUsage,
     cacheExpiresAt,
   };
 }
 
-/** Calls your Agent endpoint. Adjust URL/body to match your server. */
+/** Calls the credit-conscious arbitrage scan endpoint. */
 async function runAgentScan(request: ScanRequest): Promise<ArbitrageScanResult> {
-  const res = await apiRequest("POST", "/api/agent/run", {
-    agent: "arbitrage",
-    input: { action: "scan", request, confirmed: true },
+  const res = await apiRequest("POST", "/api/scan/arbs", {
+    ...request,
+    confirmed: true,
+    useCachedOdds: true, // 👈 add this temporarily while iterating
   });
   const data = await res.json();
   return normalizeAgentResult(data);
 }
 
+
+
 /* -------------------- Component -------------------- */
 export default function Arbitrage() {
   const { toast } = useToast();
+  // Shared active opportunities from backend (any page / previous scans)
+  const { data: activeOpportunities = [], isLoading: activeOppLoading } =
+    useQuery<ArbitrageOpportunityDisplay[]>({
+      queryKey: ["/api/arbitrage/opportunities"],
+    });
+
   const [scanResults, setScanResults] = useState<ArbitrageScanResult | null>(null);
   const [lastScanTime, setLastScanTime] = useState<Date | null>(null);
 
   const [filters, setFilters] = useState<ScanRequest>({
-    states: [],
+    // NOTE: The "states" here are Odds-API sports keys, which is a bit misnamed,
+    // but we'll keep it as-is to avoid touching the rest of the app.
+    states: ["americanfootball_nfl"],
     sports: ["all"],
     regions: ["us", "us2"],
     markets: ["h2h", "spreads", "totals"],
@@ -117,7 +239,9 @@ export default function Arbitrage() {
       setLastScanTime(new Date());
       toast({
         title: "Agent Scan Complete",
-        description: `Found ${data.allOpportunities?.length || 0} opportunities. Credits used: ${data.creditUsage?.creditsConsumed || 0}`,
+        description: `Found ${data.allOpportunities?.length || 0} opportunities. Credits used: ${
+          data.creditUsage?.creditsConsumed || 0
+        }`,
       });
     },
     onError: (error: any) => {
@@ -144,11 +268,25 @@ export default function Arbitrage() {
   const availableStates = stateMap?.stateMap ? Object.keys(stateMap.stateMap) : [];
 
   // Derived stats
-  const opportunities = scanResults?.allOpportunities ?? [];
+  // Prefer the current scan's board; otherwise fall back to shared active opps
+  const opportunities: ArbitrageOpportunityDisplay[] =
+    scanResults?.allOpportunities?.length
+      ? scanResults.allOpportunities
+      : activeOpportunities;
+
   const maxProfitPick = scanResults?.maxProfitPick;
   const totalOpportunities = opportunities.length;
-  const maxProfit = maxProfitPick?.expectedProfitPct ?? 0;
+
+  const displayMaxProfit =
+    maxProfitPick && typeof maxProfitPick.expectedProfitPct === "number"
+      ? maxProfitPick.expectedProfitPct
+      : 0;
+
   const creditsUsed = scanResults?.creditUsage?.creditsConsumed ?? 0;
+
+  // Only show "Maximum Profit Opportunity" if we actually have a positive edge
+  const showMaxProfitCard =
+    !!maxProfitPick && maxProfitPick.expectedProfitPct > 0 && maxProfitPick.legs.length > 0;
 
   return (
     <div className="space-y-8">
@@ -188,7 +326,9 @@ export default function Arbitrage() {
             <div className="flex items-center justify-between">
               <div>
                 <p className="text-sm text-muted-foreground">Max Profit %</p>
-                <p className="text-2xl font-bold text-green-500">{maxProfit.toFixed(2)}%</p>
+                <p className="text-2xl font-bold text-green-500">
+                  {displayMaxProfit.toFixed(2)}%
+                </p>
               </div>
               <Crown className="w-8 h-8 text-green-500" />
             </div>
@@ -217,7 +357,8 @@ export default function Arbitrage() {
                     ? `${Math.max(
                         0,
                         Math.ceil(
-                          (new Date(scanResults.cacheExpiresAt).getTime() - Date.now()) / 60000
+                          (new Date(scanResults.cacheExpiresAt).getTime() - Date.now()) /
+                            60000
                         )
                       )}m`
                     : "0m"}
@@ -395,7 +536,7 @@ export default function Arbitrage() {
 
         {/* Results */}
         <div className="lg:col-span-3 space-y-6">
-          {maxProfitPick && (
+          {showMaxProfitCard && maxProfitPick && (
             <Card className="border-2 border-green-500/20 bg-green-50/50 dark:bg-green-950/20">
               <CardHeader>
                 <div className="flex items-center justify-between">
@@ -419,11 +560,18 @@ export default function Arbitrage() {
                       >
                         <div>
                           <p className="font-medium">{leg.outcome}</p>
-                          <p className="text-sm text-muted-foreground">{leg.sportsbook}</p>
+                          <p className="text-sm text-muted-foreground">
+                            {leg.sportsbook}
+                          </p>
                         </div>
                         <div className="text-right">
                           <p className="font-medium text-green-600">{leg.odds}</p>
-                          <p className="text-sm text-muted-foreground">${leg.stake}</p>
+                          <p className="text-sm text-muted-foreground">
+                            {/* stakeBps is basis points; convert to % of bankroll */}
+                            {leg.stakeBps > 0
+                              ? `${(leg.stakeBps / 100).toFixed(1)}% of bankroll`
+                              : ""}
+                          </p>
                         </div>
                       </div>
                     ))}
@@ -441,7 +589,7 @@ export default function Arbitrage() {
                       <div className="text-center p-3 bg-white dark:bg-gray-900 rounded-lg border">
                         <p className="text-sm text-muted-foreground">Confidence</p>
                         <p className="text-lg font-bold text-blue-600">
-                          {(maxProfitPick.confidenceScore * 100).toFixed(0)}%
+                          {(maxProfitPick.confidenceScore ?? 0).toFixed(0)}%
                         </p>
                       </div>
                     </div>
@@ -454,7 +602,7 @@ export default function Arbitrage() {
           <Card>
             <CardHeader>
               <div className="flex items-center justify-between">
-                <CardTitle>All Opportunities</CardTitle>
+                <CardTitle>All Value / Safer Opportunities</CardTitle>
                 <Badge variant="secondary">{opportunities.length} Found</Badge>
               </div>
             </CardHeader>
@@ -475,10 +623,15 @@ export default function Arbitrage() {
                       const isFeatured =
                         maxProfitPick && opportunity.id === maxProfitPick.eventId;
                       return (
-                        <div key={opportunity.id} className={isFeatured ? "opacity-50 relative" : ""}>
+                        <div
+                          key={opportunity.id}
+                          className={isFeatured ? "opacity-50 relative" : ""}
+                        >
                           {isFeatured && (
                             <div className="absolute inset-0 bg-green-500/10 rounded-lg border border-green-500/20 flex items-center justify-center">
-                              <Badge className="bg-green-600 text-white">Featured Above</Badge>
+                              <Badge className="bg-green-600 text-white">
+                                Featured Above
+                              </Badge>
                             </div>
                           )}
                           <ArbitrageCard opportunity={opportunity} />
@@ -486,12 +639,24 @@ export default function Arbitrage() {
                       );
                     })}
                 </div>
+              ) : scanResults && showMaxProfitCard ? (
+                // We have a top opportunity card above but no additional ones
+                <div className="text-center py-12">
+                  <TrendingUp className="w-12 h-12 text-muted-foreground mx-auto mb-4" />
+                  <h3 className="text-lg font-medium mb-2">Only Top Opportunity Found</h3>
+                  <p className="text-muted-foreground mb-4">
+                    The agent found one best value / safer hedged opportunity (shown
+                    above), but no additional markets met your settings.
+                  </p>
+                </div>
               ) : scanResults ? (
                 <div className="text-center py-12">
                   <TrendingUp className="w-12 h-12 text-muted-foreground mx-auto mb-4" />
                   <h3 className="text-lg font-medium mb-2">No Opportunities Found</h3>
                   <p className="text-muted-foreground mb-4">
-                    No arbitrage opportunities found with your current settings. Try adjusting your filters.
+                    No value / safer hedged opportunities were found with your current
+                    settings. Try scanning again later when lines have moved or broadening
+                    your filters.
                   </p>
                 </div>
               ) : (
@@ -499,7 +664,8 @@ export default function Arbitrage() {
                   <Search className="w-12 h-12 text-muted-foreground mx-auto mb-4" />
                   <h3 className="text-lg font-medium mb-2">Ready to Scan</h3>
                   <p className="text-muted-foreground mb-4">
-                    Configure your settings and click "Search All Sportsbooks" to run the agent.
+                    Configure your settings and click &quot;Search All Sportsbooks&quot;
+                    to run the agent.
                   </p>
                 </div>
               )}

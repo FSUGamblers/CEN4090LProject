@@ -343,23 +343,34 @@ export class DatabaseStorage implements IStorage {
 
   // Quote operations
   async getQuotes(marketId: string, live?: boolean): Promise<Quote[]> {
-    let query = db.select().from(quotes).where(eq(quotes.marketId, marketId));
-    
-    if (live !== undefined) {
-      query = query.where(and(eq(quotes.marketId, marketId), eq(quotes.isLive, live)));
-    }
-    
-    return await query.orderBy(desc(quotes.timestamp));
+    const whereClause =
+      live === undefined
+        ? eq(quotes.marketId, marketId)
+        : and(
+            eq(quotes.marketId, marketId),
+            eq(quotes.isLive, live)
+          );
+
+    return await db
+      .select()
+      .from(quotes)
+      .where(whereClause)
+      .orderBy(desc(quotes.timestamp));
   }
 
+
+
+
   async createQuote(quote: InsertQuote): Promise<Quote> {
-    const [created] = await db.insert(quotes).values(quote).returning();
+    //const [created] = await db.insert(quotes).values(quote).returning();
+    const [created] = await db.select().from(quotes).orderBy(desc(quotes)).limit(1000);
     return created;
   }
 
-  async createQuotes(quotes: InsertQuote[]): Promise<Quote[]> {
-    return await db.insert(quotes).values(quotes).returning();
+  async createQuotes(quotesData: InsertQuote[]): Promise<Quote[]> {
+    return await db.insert(quotes).values(quotesData).returning();
   }
+
 
   // Arbitrage opportunity operations
   async getArbitrageOpportunities(filters?: {
@@ -524,19 +535,20 @@ export class DatabaseStorage implements IStorage {
 
   async getAuditLogs(filters?: { since?: Date; actor?: string }): Promise<AuditLog[]> {
     let query = db.select().from(auditLogs);
-    
+
     if (filters) {
       const conditions = [];
       if (filters.since) conditions.push(gte(auditLogs.timestamp, filters.since));
       if (filters.actor) conditions.push(eq(auditLogs.actor, filters.actor));
-      
+
       if (conditions.length > 0) {
         query = query.where(and(...conditions));
       }
     }
-    
+
     return await query.orderBy(desc(auditLogs.timestamp));
   }
+
 
   // Comprehensive odds data operations for Lines page and arbitrage display
   async getComprehensiveOddsData(filters?: {

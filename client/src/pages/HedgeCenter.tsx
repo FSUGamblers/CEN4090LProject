@@ -314,7 +314,7 @@ export default function HedgeCenter() {
                       </div>
                     </div>
 
-                    {/* Mock hedge suggestion */}
+                    {/* Example hedge suggestion UI could go here */}
                     <div className="bg-amber-500/10 border border-amber-500/20 rounded-lg p-3 mt-3">
                       <div className="flex items-center gap-2 mb-2">
                         <AlertTriangle className="w-4 h-4 text-amber-500" />

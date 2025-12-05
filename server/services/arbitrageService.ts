@@ -2,6 +2,15 @@ import { storage } from "../storage";
 import { auditService } from "./auditService";
 import type { ArbitrageOpportunity, Quote } from "@shared/schema";
 
+interface TeamFormStats {
+  teamName: string;
+  games: number;
+  pointsFor: number;
+  pointsAgainst: number;
+  avgMargin: number; // (pointsFor - pointsAgainst) / games
+}
+
+
 // Credit-conscious arbitrage interfaces
 interface EstimateRequest {
   states: string[];
@@ -120,6 +129,102 @@ class ArbitrageService {
     "WY": ["draftkings", "fanduel"]
   };
 
+  // Inside class ArbitrageService { ... }
+  private oddsCache:
+    | {
+        expiresAt: number;
+        data: any[]; // same shape as comprehensiveOddsData
+        creditUsage: { used: number; remaining: number };
+      }
+    | null = null;
+
+  private async getNflTeamFormStats(): Promise<Map<string, TeamFormStats>> {
+    const result = new Map<string, TeamFormStats>();
+
+    try {
+      const apiKey = process.env.ODDS_API_KEY;
+      if (!apiKey) {
+        console.warn("[ARB] No ODDS_API_KEY set; skipping team form stats");
+        return result;
+      }
+
+      const url = new URL(
+        "https://api.the-odds-api.com/v4/sports/americanfootball_nfl/scores"
+      );
+
+      // Look back ~2 weeks of completed games
+      url.searchParams.set("apiKey", apiKey);
+      url.searchParams.set("daysFrom", "-14");
+      url.searchParams.set("dateFormat", "iso");
+      url.searchParams.set("completed", "true");
+
+      const resp = await fetch(url.toString());
+      if (!resp.ok) {
+        console.warn(
+          "[ARB] getNflTeamFormStats: non-200 from scores endpoint",
+          resp.status,
+          await resp.text()
+        );
+        return result;
+      }
+
+      const games: any[] = await resp.json();
+
+      const upsertTeam = (teamName: string, pf: number, pa: number) => {
+        const key = teamName.trim();
+        let rec = result.get(key);
+        if (!rec) {
+          rec = {
+            teamName: key,
+            games: 0,
+            pointsFor: 0,
+            pointsAgainst: 0,
+            avgMargin: 0,
+          };
+          result.set(key, rec);
+        }
+        rec.games += 1;
+        rec.pointsFor += pf;
+        rec.pointsAgainst += pa;
+      };
+
+      for (const game of games) {
+        if (!Array.isArray(game.scores) || game.scores.length !== 2) {
+          continue;
+        }
+
+
+        const [homeScoreObj, awayScoreObj] = game.scores;
+        const homeScore = Number(homeScoreObj?.score);
+        const awayScore = Number(awayScoreObj?.score);
+
+        if (!Number.isFinite(homeScore) || !Number.isFinite(awayScore)) continue;
+
+        upsertTeam(homeScoreObj.name, homeScore, awayScore);
+        upsertTeam(awayScoreObj.name, awayScore, homeScore);
+      }
+
+      // ✅ Use forEach instead of "for...of result.values()" to avoid
+      // downlevelIteration / ES2015 target issues
+      result.forEach((rec) => {
+        if (rec.games > 0) {
+          rec.avgMargin = (rec.pointsFor - rec.pointsAgainst) / rec.games;
+        }
+      });
+
+      console.log(
+        "[ARB] getNflTeamFormStats built form map for",
+        result.size,
+        "teams"
+      );
+    } catch (err) {
+      console.error("[ARB] Failed to fetch NFL team form stats:", err);
+    }
+
+    return result;
+  }
+
+
   /**
    * Credit-conscious estimate: NO API calls, just planning
    * Shows user exactly what endpoints would be hit and estimated costs
@@ -128,7 +233,7 @@ class ArbitrageService {
   async estimateAPIUsage(request: EstimateRequest): Promise<EstimateResponse> {
     const { 
       states, 
-      sports = ["all"], 
+      sports = ["americanfootball_nfl"], 
       regions = ["us", "us2"], 
       markets = ["h2h", "spreads", "totals"],
       minProfitPct = 1.0 
@@ -219,7 +324,10 @@ class ArbitrageService {
    * Execute arbitrage scan: Makes actual API calls after user confirmation
    * Stores ALL fetched data in database and returns comprehensive odds display data
    */
-  async scanArbitrageOpportunities(request: EstimateRequest, userId: string): Promise<{
+  async scanArbitrageOpportunities(
+    request: EstimateRequest,
+    userId: string
+  ): Promise<{
     maxProfitPick: MaxProfitPick | null;
     rankedOpportunities: MaxProfitPick[];
     comprehensiveOddsData: Array<{
@@ -248,60 +356,131 @@ class ArbitrageService {
     creditUsage: {
       used: number;
       remaining: number;
+      requestsUsed: number;
+      creditsConsumed: number;
     };
     executionTime: number;
   }> {
     const startTime = Date.now();
     let totalCreditsUsed = 0;
     let remainingCredits = 500;
-    
+
+    // Normalize minProfitPct once (used for ranking / thresholds)
+    const minProfitPct = request.minProfitPct ?? 0.1;
+
     const job = await storage.createJobRun({
       jobName: "arbitrage_scan",
       status: "running",
     });
 
     try {
-      await auditService.log(userId, "arbitrage_scan_started", "job", job.id, request);
+      await auditService.log(
+        userId,
+        "arbitrage_scan_started",
+        "job",
+        job.id,
+        request
+      );
 
       // Step 1: Filter eligible sportsbooks by states
       const eligibleBookmakers = this.filterBookmakersByStates(request.states);
       if (eligibleBookmakers.length === 0) {
-        throw new Error(`No sportsbooks accessible in selected states: ${request.states.join(", ")}`);
+        throw new Error(
+          `No sportsbooks accessible in selected states: ${request.states.join(", ")}`
+        );
       }
 
-      // Step 2: Fetch and store live odds data with comprehensive storage
-      const { opportunities: oddsData, creditUsage, comprehensiveData } = await this.fetchAndStoreOddsData(request, eligibleBookmakers);
-      totalCreditsUsed = creditUsage.used;
-      remainingCredits = creditUsage.remaining;
-      
-      // Step 3: Calculate arbitrage opportunities from stored data
-      const opportunities = await this.calculateArbitrageOpportunities(oddsData, request.minProfitPct || 1.0);
+      // Step 2: Reuse cached odds if still fresh; otherwise fetch new ones
+      const cacheTtlMs = 10 * 60 * 1000; // 10 minutes
+      let comprehensiveData: any[] | null = null;
 
-      // Step 4: Rank by locked profit and select Max Profit Pick
-      const rankedOpportunities = opportunities.sort((a, b) => b.lockedProfit - a.lockedProfit);
-      const maxProfitPick = rankedOpportunities.length > 0 ? rankedOpportunities[0] : null;
+      const now = Date.now();
+      if (this.oddsCache && this.oddsCache.expiresAt > now) {
+        console.log(
+          "[VALUE] Reusing cached odds data from previous scan; expires at",
+          new Date(this.oddsCache.expiresAt).toISOString()
+        );
+        comprehensiveData = this.oddsCache.data;
+        // For cached runs, we treat this as using 0 new credits
+        totalCreditsUsed = 0;
+        remainingCredits = this.oddsCache.creditUsage.remaining ?? 500;
+      } else {
+        const { comprehensiveData: freshData, creditUsage } =
+          await this.fetchAndStoreOddsData(request, eligibleBookmakers);
 
-      // Step 5: Store results with short expiry (5 minutes for live odds)
+        comprehensiveData = freshData || [];
+        totalCreditsUsed = creditUsage.used;
+        remainingCredits = creditUsage.remaining;
+
+        this.oddsCache = {
+          expiresAt: now + cacheTtlMs,
+          data: comprehensiveData,
+          creditUsage: {
+            used: creditUsage.used,
+            remaining: creditUsage.remaining,
+          },
+        };
+
+        console.log(
+          "[ARB] scan: fetchAndStoreOddsData returned",
+          comprehensiveData ? comprehensiveData.length : 0,
+          "events with markets"
+        );
+      }
+
+      // Step 3: Calculate value / safest opportunities from stored odds
+      const opportunities = await this.calculateArbitrageOpportunities(
+        comprehensiveData || [],
+        minProfitPct
+      );
+
+      // Step 4: Rank by edge (profitPct) and select Max Profit Pick
+      const rankedOpportunities = opportunities.sort(
+        (a, b) => b.profitPct - a.profitPct
+      );
+      const maxProfitPick =
+        rankedOpportunities.length > 0 ? rankedOpportunities[0] : null;
+
+      // Step 5: Store the top pick (clamped) even if not strictly positive EV
       if (maxProfitPick) {
-        await storage.createArbitrageOpportunity({
-          eventId: maxProfitPick.event.id,
-          marketId: "market_" + maxProfitPick.market.type.toLowerCase(),
-          legs: maxProfitPick.legs.map(leg => ({
-            sportsbookId: leg.sportsbook.toLowerCase(),
-            outcomeId: leg.outcome,
-            priceValue: this.convertAmericanToDecimal(parseInt(leg.odds.replace(/[+]/g, ''))),
-            stakeFraction: leg.stake / 10000 // Normalize to fraction
-          })),
-          expectedProfitPct: maxProfitPick.profitPct.toString(),
-          notionalBankroll: "10000",
-          recommendedStakes: Object.fromEntries(
-            maxProfitPick.legs.map(leg => [leg.sportsbook, leg.stake])
-          ),
-          validityWindow: 300, // 5 minutes
-          confidenceScore: maxProfitPick.confidenceScore.toString(),
-          constraintsApplied: [`states:${request.states.join(",")}`],
-          expiresAt: new Date(Date.now() + 5 * 60 * 1000),
-        });
+        try {
+          // Clamp expectedProfitPct to fit NUMERIC(3,2) -> [-9.99, 9.99]
+          const clampedProfitPct = Math.max(
+            -9.99,
+            Math.min(9.99, maxProfitPick.profitPct)
+          );
+
+          await storage.createArbitrageOpportunity({
+            eventId: maxProfitPick.event.id,
+            // Synthetic market key (aggregated "best of board")
+            marketId: "market_" + maxProfitPick.market.type.toLowerCase(),
+            legs: maxProfitPick.legs.map((leg) => ({
+              // If your schema stores numeric sportsbook IDs, adapt here
+              sportsbookId: leg.sportsbook.toLowerCase(),
+              outcomeId: leg.outcome,
+              priceValue: this.convertAmericanToDecimal(
+                parseInt(leg.odds.replace(/[+]/g, ""))
+              ),
+              // Normalize stake to fraction of notional bankroll (10000 units)
+              stakeFraction: leg.stake / 10000,
+            })),
+            expectedProfitPct: clampedProfitPct.toFixed(2),
+            notionalBankroll: "10000",
+            recommendedStakes: Object.fromEntries(
+              maxProfitPick.legs.map((leg) => [leg.sportsbook, leg.stake])
+            ),
+            validityWindow: 300, // 5 minutes
+            confidenceScore: maxProfitPick.confidenceScore.toString(),
+            constraintsApplied: [`states:${request.states.join(",")}`],
+            expiresAt: new Date(Date.now() + 5 * 60 * 1000),
+          });
+        } catch (err) {
+          console.error(
+            "[ARB] Failed to persist arbitrage/value opportunity:",
+            err
+          );
+          // Don't rethrow – scan should still succeed
+        }
       }
 
       const executionTime = Date.now() - startTime;
@@ -314,26 +493,34 @@ class ArbitrageService {
           maxProfitPct: maxProfitPick?.profitPct || 0,
           executionTimeMs: executionTime,
           statesFiltered: request.states.length,
-          eligibleBookmakers: eligibleBookmakers.length
+          eligibleBookmakers: eligibleBookmakers.length,
         },
       });
 
-      await auditService.log(userId, "arbitrage_scan_completed", "job", job.id, {
-        opportunitiesFound: opportunities.length,
-        maxProfit: maxProfitPick?.lockedProfit || 0
-      });
+      await auditService.log(
+        userId,
+        "arbitrage_scan_completed",
+        "job",
+        job.id,
+        {
+          opportunitiesFound: opportunities.length,
+          maxProfit: maxProfitPick?.lockedProfit || 0,
+        }
+      );
 
       return {
         maxProfitPick,
-        rankedOpportunities: rankedOpportunities.slice(0, 10), // Top 10
+        // Full ranked board to drive “All Value / Safer Opportunities”
+        rankedOpportunities: rankedOpportunities.slice(0, 10),
         comprehensiveOddsData: comprehensiveData || [],
         creditUsage: {
-          used: totalCreditsUsed, // Real API credit usage
-          remaining: remainingCredits // Real remaining credits
+          used: totalCreditsUsed,
+          remaining: remainingCredits,
+          requestsUsed: totalCreditsUsed,
+          creditsConsumed: totalCreditsUsed,
         },
-        executionTime
+        executionTime,
       };
-
     } catch (error) {
       await storage.updateJobRun(job.id, {
         status: "failed",
@@ -344,6 +531,11 @@ class ArbitrageService {
       throw error;
     }
   }
+
+
+
+
+
 
   /**
    * Filter bookmakers by state accessibility using state map
@@ -375,117 +567,91 @@ class ArbitrageService {
   /**
    * Fetch odds data from Odds API and store ALL data in database
    */
-  private async fetchAndStoreOddsData(request: EstimateRequest, eligibleBookmakers: string[]): Promise<{
-    opportunities: any[];
-    creditUsage: { used: number; remaining: number };
-    comprehensiveData: Array<{
-      event: {
-        id: string;
-        homeTeam: string;
-        awayTeam: string;
-        sport: string;
-        league: string;
-        startTime: string;
-        status: string;
-      };
-      markets: Array<{
-        type: string;
-        description: string;
-        outcomes: Array<{
-          name: string;
-          odds: Array<{
-            sportsbook: string;
-            price: string;
-            decimal: number;
+    private async fetchAndStoreOddsData(
+      request: EstimateRequest,
+      eligibleBookmakers: string[]
+    ): Promise<{
+      opportunities: any[];
+      creditUsage: { used: number; remaining: number };
+      comprehensiveData: Array<{
+        event: {
+          id: string;
+          homeTeam: string;
+          awayTeam: string;
+          sport: string;
+          league: string;
+          startTime: string;
+          status: string;
+        };
+        markets: Array<{
+          type: string;
+          description: string;
+          outcomes: Array<{
+            name: string;
+            odds: Array<{
+              sportsbook: string;
+              price: string;
+              decimal: number;
+            }>;
           }>;
         }>;
       }>;
-    }>;
-  }> {
-    // Use real oddsService to fetch live data
-    const sports = request.sports?.includes('all') 
-      ? ["basketball_nba", "americanfootball_nfl", "baseball_mlb", "icehockey_nhl"]
-      : request.sports || ["basketball_nba"];
-    
-    let totalCreditsUsed = 0;
-    let remainingCredits = 500;
-    
-    // Import oddsService dynamically to avoid circular dependencies
-    const { oddsService } = await import('./oddsService');
-    
-    try {
-      // Track credits used across all sports API calls and ensure data storage
-      const { data: apiData, creditUsage: apiCreditUsage } = await oddsService.fetchFromOddsAPI({ 
-        leagues: sports,
-        liveOnly: false,
-        maxPages: 3 
-      });
-      
-      // Use real credit usage from API
-      totalCreditsUsed = apiCreditUsage.used;
-      remainingCredits = apiCreditUsage.remaining;
-      
-      console.log(`API returned ${apiData.length} events. Processing and storing in database...`);
-      
-      // Process and store ALL fetched data in database
-      const comprehensiveData = await this.processAndStoreOddsData(apiData, eligibleBookmakers);
-      
-      // Get stored data from database for arbitrage calculations
-      const events = await storage.getEvents({ from: new Date(Date.now() - 24 * 60 * 60 * 1000) }); // Last 24 hours
-      
-      // Get all quotes for arbitrage calculations
-      const allQuotes = [];
-      for (const event of events) {
-        const markets = await storage.getMarkets(event.id);
-        for (const market of markets) {
-          const quotes = await storage.getQuotes(market.id);
-          allQuotes.push(...quotes);
-        }
-      }
-      
-      const opportunities = this.convertToArbitrageFormat(events, allQuotes, eligibleBookmakers);
-      
-      // If no opportunities found from real data, fall back to mock but preserve real credit usage
-      if (opportunities.length === 0) {
-        console.log("No real opportunities found, using mock data but preserving real credit usage");
-        const mockOpportunities = this.getMockArbitrageData(eligibleBookmakers);
-        return {
-          opportunities: mockOpportunities,
+    }> {
+      // Only NFL for now
+      const sports =
+        request.sports?.includes("all")
+          ? ["americanfootball_nfl"]
+          : request.sports || ["americanfootball_nfl"];
+
+      let totalCreditsUsed = 0;
+      let remainingCredits = 500;
+
+      // Import oddsService dynamically to avoid circular dependencies
+      const { oddsService } = await import("./oddsService");
+
+      try {
+        // Fetch real odds from The Odds API
+        const { data: apiData, creditUsage: apiCreditUsage } =
+          await oddsService.fetchFromOddsAPI({
+            leagues: sports,
+            liveOnly: false,
+            maxPages: 3,
+          });
+
+        // Track real credit usage
+        totalCreditsUsed = apiCreditUsage.used;
+        remainingCredits = apiCreditUsage.remaining;
+
+        console.log(
+          `API returned ${apiData.length} events. Processing and storing in database...`
+        );
+
+        // Process and store ALL fetched data in database (returns a rich, structured view)
+        const comprehensiveData = await this.processAndStoreOddsData(
+          apiData,
+          eligibleBookmakers
+        );
+
+        // Convert that structured view into the format used by the arbitrage calculator
+        const oddsData = this.convertToArbitrageFormat(
           comprehensiveData,
-          creditUsage: { 
-            used: totalCreditsUsed, 
-            remaining: remainingCredits
-          }
+          eligibleBookmakers
+        );
+
+        return {
+          opportunities: oddsData,
+          comprehensiveData,
+          creditUsage: {
+            used: totalCreditsUsed,
+            remaining: remainingCredits,
+          },
         };
+      } catch (error) {
+        console.error("Failed to fetch real odds data:", error);
+        throw error;
       }
-      
-      return {
-        opportunities,
-        comprehensiveData,
-        creditUsage: { 
-          used: totalCreditsUsed, 
-          remaining: remainingCredits
-        }
-      };
-    } catch (error) {
-      console.error("Failed to fetch real odds data, falling back to simulation:", error);
-      // Fallback to simulated data if API fails
     }
-    
-    // Fallback mock data if API fails
-    const mockOpportunities = this.getMockArbitrageData(eligibleBookmakers);
-    const mockComprehensiveData = this.convertMockToComprehensiveFormat(mockOpportunities);
-    
-    return {
-      opportunities: mockOpportunities,
-      comprehensiveData: mockComprehensiveData,
-      creditUsage: { 
-        used: 0, 
-        remaining: 500
-      }
-    };
-  }
-  
+
   /**
    * Process and store API data in database with proper relationships
    */
@@ -579,30 +745,44 @@ class ArbitrageService {
             // Find or create market
             const existingMarkets = await storage.getMarkets(event.id);
             let market = existingMarkets.find(m => m.marketType === marketData.key);
-            
+
+            // Normalize outcomes for this market so each side has a stable ID
+            const normalizedOutcomes = marketData.outcomes.map((outcome: any, index: number) => {
+              const baseName = outcome.name || `Outcome ${index + 1}`;
+              const baseId = `${marketData.key}_${baseName}`
+                .toLowerCase()
+                .replace(/[^a-z0-9]+/g, "_")
+                .replace(/^_+|_+$/g, "");
+
+              return {
+                id: baseId,
+                label: baseName,
+              };
+            });
+
+            // Create market if it doesn't exist yet
             if (!market) {
-              const outcomes = marketData.outcomes.map((outcome: any, index: number) => ({
-                id: `outcome_${index}`,
-                label: outcome.name
-              }));
-              
               market = await storage.createMarket({
                 eventId: event.id,
                 marketType: marketData.key,
-                outcomes: outcomes,
+                outcomes: normalizedOutcomes,
               });
             }
 
-            // Create quotes for each outcome
+            // Create quotes for each outcome, using the normalized outcome IDs
             for (let i = 0; i < marketData.outcomes.length; i++) {
               const outcome = marketData.outcomes[i];
-              
+              const outcomeMeta = normalizedOutcomes[i];
+              const outcomeId =
+                outcomeMeta?.id ||
+                `${marketData.key}_${i}`;
+
               await storage.createQuote({
                 marketId: market.id,
                 sportsbookId: sportsbook.id,
-                outcomeId: `outcome_${i}`,
+                outcomeId,
                 priceFormat: "decimal",
-                priceValue: outcome.price.toString(),
+                priceValue: outcome.price.toString(), // still decimal odds from the API
                 isLive: false,
                 stateAvailability: sportsbook.supportedStates,
               });
@@ -610,54 +790,126 @@ class ArbitrageService {
           }
         }
 
-        // 6. Build comprehensive display data
-        const markets = await storage.getMarkets(event.id);
-        const eventMarketData = [];
-        
-        for (const market of markets) {
-          const quotes = await storage.getQuotes(market.id);
-          
-          // Group quotes by outcome
-          const outcomeMap = new Map();
-          for (const quote of quotes) {
-            if (!outcomeMap.has(quote.outcomeId)) {
-              outcomeMap.set(quote.outcomeId, {
-                name: market.outcomes?.[parseInt(quote.outcomeId.split('_')[1])]?.label || 'Unknown',
-                odds: []
-              });
+      // 6. Build comprehensive display data DIRECTLY from the API event
+      // This avoids any mismatch between DB storage and our in-memory view for arbitrage.
+      const marketGroups = new Map<
+        string,
+        {
+          type: string;
+          description: string;
+          outcomes: Map<
+            string,
+            {
+              name: string;
+              odds: Array<{
+                sportsbook: string;
+                price: string;
+                decimal: number;
+              }>;
             }
-            
-            const sportsbooks = await storage.getSportsbooks();
-            const sportsbook = sportsbooks.find(sb => sb.id === quote.sportsbookId);
-            
-            if (sportsbook) {
-              outcomeMap.get(quote.outcomeId).odds.push({
-                sportsbook: sportsbook.name,
-                price: this.formatPrice(parseFloat(quote.priceValue)),
-                decimal: parseFloat(quote.priceValue)
-              });
-            }
+          >;
+        }
+      >();
+
+      for (const bookmaker of eventData.bookmakers || []) {
+        // Respect the same eligibleBookmakers filter we used for storage
+        if (!eligibleBookmakers.includes(bookmaker.key)) continue;
+
+        const sportsbookName = bookmaker.title;
+
+        for (const marketData of bookmaker.markets || []) {
+          const marketType = marketData.key; // e.g. "h2h", "spreads", "totals"
+          const description = this.getMarketDescription(marketType);
+
+          let group = marketGroups.get(marketType);
+          if (!group) {
+            group = {
+              type: marketType,
+              description,
+              outcomes: new Map(),
+            };
+            marketGroups.set(marketType, group);
           }
-          
-          eventMarketData.push({
-            type: market.marketType,
-            description: this.getMarketDescription(market.marketType),
-            outcomes: Array.from(outcomeMap.values())
-          });
+
+          for (const outcome of marketData.outcomes || []) {
+            const outcomeName = outcome.name || "Outcome";
+
+            let outcomeEntry = group.outcomes.get(outcomeName);
+            if (!outcomeEntry) {
+              outcomeEntry = { name: outcomeName, odds: [] };
+              group.outcomes.set(outcomeName, outcomeEntry);
+            }
+
+            const decimal = Number(outcome.price);
+            // Filter out garbage/degenerate odds
+            if (!Number.isFinite(decimal) || decimal <= 1.01) continue;
+
+            outcomeEntry.odds.push({
+              sportsbook: sportsbookName,
+              price: this.formatPrice(decimal), // uses your existing helper
+              decimal,
+            });
+          }
+        }
+      }
+
+      // Convert marketGroups -> eventMarketData in the shape expected by calculateArbitrageOpportunities
+      const eventMarketData: Array<{
+        type: string;
+        description: string;
+        outcomes: Array<{
+          name: string;
+          odds: Array<{
+            sportsbook: string;
+            price: string;
+            decimal: number;
+          }>;
+        }>;
+      }> = [];
+
+      // Iterate over marketGroups without using `for...of` on the Map
+      marketGroups.forEach((group) => {
+        // Make TS aware of the outcome shape
+        const allOutcomes = Array.from(
+          group.outcomes.values()
+        ) as {
+          name: string;
+          odds: {
+            sportsbook: string;
+            price: string;
+            decimal: number;
+          }[];
+        }[];
+
+        const filteredOutcomes = allOutcomes.filter((o) => o.odds.length > 0);
+
+        // Only keep markets where we have at least 2 outcomes with odds
+        if (filteredOutcomes.length < 2) {
+          return;
         }
 
-        comprehensiveData.push({
-          event: {
-            id: event.id,
-            homeTeam: eventData.home_team,
-            awayTeam: eventData.away_team,
-            sport: eventData.sport_title,
-            league: league.name,
-            startTime: new Date(eventData.commence_time).toLocaleString(),
-            status: "scheduled"
-          },
-          markets: eventMarketData
+        eventMarketData.push({
+          type: group.type,
+          description: group.description,
+          outcomes: filteredOutcomes,
         });
+      });
+
+
+      // Finally push this event into comprehensiveData
+      comprehensiveData.push({
+        event: {
+          id: event.id,
+          homeTeam: eventData.home_team,
+          awayTeam: eventData.away_team,
+          sport: eventData.sport_title,
+          league: league.name,
+          startTime: new Date(eventData.commence_time).toLocaleString(),
+          status: "scheduled",
+        },
+        markets: eventMarketData,
+      });
+
 
       } catch (error) {
         console.error(`Error processing event ${eventData.id}:`, error);
@@ -670,66 +922,72 @@ class ArbitrageService {
   }
 
   /**
-   * Convert real API data to arbitrage calculation format
+   * Convert comprehensive odds data into the format used by calculateArbitrageOpportunities
    */
-  private convertToArbitrageFormat(events: any[], quotes: any[], eligibleBookmakers: string[]) {
-    console.log(`Converting ${events.length} events and ${quotes.length} quotes for arbitrage calculations`);
-    
-    // For now, return empty array - the comprehensive data is the main output
-    // Arbitrage opportunities will be calculated from the stored data in a future iteration
-    return [];
+  private convertToArbitrageFormat(
+    comprehensiveData: any[],
+    eligibleBookmakers: string[]
+  ) {
+    console.log(
+      `Converting ${comprehensiveData.length} events for arbitrage calculations`
+    );
+
+    // Helper: normalize a sportsbook display name into a key like "draftkings"
+    const toKey = (name: string) =>
+      (name || "").toLowerCase().replace(/\s+/g, "");
+
+    return (comprehensiveData || []).map((entry: any) => {
+      const event = entry.event || {};
+      const markets = entry.markets || [];
+
+      return {
+        eventId: event.id,
+        homeTeam: event.homeTeam,
+        awayTeam: event.awayTeam,
+        sport: event.sport,
+        league: event.league,
+        startTime: event.startTime,
+        markets: markets.map((market: any) => ({
+          type: market.type,
+          description: market.description,
+          outcomes: (market.outcomes || []).map((outcome: any) => {
+            // outcome.odds: [{ sportsbook, price: string ("+110" / "-120"), decimal: number }]
+            const oddsArray = (outcome.odds || []) as Array<any>;
+
+            const filteredOdds = oddsArray.filter((od) => {
+              if (!eligibleBookmakers || eligibleBookmakers.length === 0)
+                return true;
+              const key = toKey(od.sportsbook);
+              return eligibleBookmakers.includes(key);
+            });
+
+            const bookmakers = filteredOdds.map((od) => {
+              const decimal = Number(od.decimal);
+
+              // Convert decimal odds back to an "American-style" price
+              let american: number;
+              if (decimal >= 2) {
+                american = Math.round((decimal - 1) * 100);
+              } else {
+                american = Math.round(-100 / (decimal - 1));
+              }
+
+              return {
+                key: toKey(od.sportsbook),
+                price: american,
+              };
+            });
+
+            return {
+              name: outcome.name,
+              bookmakers,
+            };
+          }),
+        })),
+      };
+    });
   }
 
-  /**
-   * Convert mock data to comprehensive format for consistent output
-   */
-  private convertMockToComprehensiveFormat(mockOpportunities: any[]): Array<{
-    event: {
-      id: string;
-      homeTeam: string;
-      awayTeam: string;
-      sport: string;
-      league: string;
-      startTime: string;
-      status: string;
-    };
-    markets: Array<{
-      type: string;
-      description: string;
-      outcomes: Array<{
-        name: string;
-        odds: Array<{
-          sportsbook: string;
-          price: string;
-          decimal: number;
-        }>;
-      }>;
-    }>;
-  }> {
-    return mockOpportunities.map(mockEvent => ({
-      event: {
-        id: mockEvent.eventId,
-        homeTeam: mockEvent.homeTeam,
-        awayTeam: mockEvent.awayTeam,
-        sport: mockEvent.sport,
-        league: mockEvent.league,
-        startTime: mockEvent.startTime,
-        status: "scheduled"
-      },
-      markets: mockEvent.markets.map((market: any) => ({
-        type: market.type,
-        description: market.description,
-        outcomes: market.outcomes.map((outcome: any) => ({
-          name: outcome.name,
-          odds: outcome.bookmakers.map((bookmaker: any) => ({
-            sportsbook: this.formatSportsbookName(bookmaker.key),
-            price: this.formatOdds(bookmaker.price),
-            decimal: this.convertAmericanToDecimal(bookmaker.price)
-          }))
-        }))
-      }))
-    }));
-  }
 
   /**
    * Helper method to format price for display
@@ -754,140 +1012,410 @@ class ArbitrageService {
     return descriptions[marketType] || marketType.toUpperCase();
   }
   
-  /**
-   * Get mock arbitrage data for fallback
-   */
-  private getMockArbitrageData(eligibleBookmakers: string[] = ["draftkings", "fanduel", "caesars", "betmgm"]) {
-    
-    const mockOddsData = [
-      {
-        eventId: "evt_nba_lakers_warriors_20250915",
-        sport: "NBA",
-        league: "National Basketball Association", 
-        homeTeam: "Golden State Warriors",
-        awayTeam: "Los Angeles Lakers",
-        startTime: "2025-09-15T20:00:00Z",
-        markets: [
-          {
-            type: "h2h",
-            description: "Moneyline",
-            outcomes: [
-              {
-                name: "Golden State Warriors",
-                bookmakers: [
-                  { key: "fanduel", price: -110 },
-                  { key: "draftkings", price: -105 },
-                  { key: "caesars", price: -115 }
-                ]
-              },
-              {
-                name: "Los Angeles Lakers", 
-                bookmakers: [
-                  { key: "fanduel", price: +105 },
-                  { key: "draftkings", price: +110 },
-                  { key: "caesars", price: +100 }
-                ]
-              }
-            ]
-          }
-        ]
-      }
-    ];
-    
-    // Filter to only include eligible bookmakers
-    return mockOddsData.map(event => ({
-      ...event,
-      markets: event.markets.map(market => ({
-        ...market,
-        outcomes: market.outcomes.map(outcome => ({
-          ...outcome,
-          bookmakers: outcome.bookmakers.filter(book => eligibleBookmakers.includes(book.key))
-        }))
-      }))
-    }));
-  }
+
 
   /**
    * Calculate arbitrage opportunities from odds data
    */
-  private async calculateArbitrageOpportunities(oddsData: any[], minProfitPct: number): Promise<MaxProfitPick[]> {
-    const opportunities: MaxProfitPick[] = [];
-    
-    for (const event of oddsData) {
-      for (const market of event.markets) {
-        // For each market, find the best price for each outcome
-        const bestPrices: Record<string, { sportsbook: string; price: number; decimal: number }> = {};
-        
-        for (const outcome of market.outcomes) {
-          let bestPrice = { sportsbook: "", price: -Infinity, decimal: 0 };
-          
-          for (const bookmaker of outcome.bookmakers) {
-            const decimal = this.convertAmericanToDecimal(bookmaker.price);
-            if (decimal > bestPrice.decimal) {
-              bestPrice = {
-                sportsbook: bookmaker.key,
-                price: bookmaker.price,
-                decimal: decimal
-              };
+  /**
+   * Calculate arbitrage / best-value opportunities from odds data.
+   *
+   * oddsData = comprehensiveData from processAndStoreOddsData:
+   * [
+   *   {
+   *     event: { id, homeTeam, awayTeam, sport, league, startTime, status },
+   *     markets: [
+   *       {
+   *         type,
+   *         description,
+   *         outcomes: [
+   *           {
+   *             name,
+   *             odds: [
+   *               { sportsbook, price, decimal }
+   *             ]
+   *           }
+   *         ]
+   *       }
+   *     ]
+   *   }
+   * ]
+   */
+  private async calculateArbitrageOpportunities(
+    eventsData: Array<{
+      event: {
+        id: string;
+        homeTeam: string;
+        awayTeam: string;
+        sport: string;
+        league: string;
+        startTime: string;
+        status: string;
+      };
+      markets: Array<{
+        type: string;
+        description: string;
+        outcomes: Array<{
+          name?: string;
+          label?: string;
+          id?: string;
+          odds: Array<{
+            sportsbook: string;
+            price: string;   // american-style string, e.g. "+120"
+            decimal: number; // decimal odds used for math
+          }>;
+        }>;
+      }>;
+    }>,
+    minProfitPct: number
+  ): Promise<MaxProfitPick[]> {
+    const safeMinProfit = minProfitPct ?? 0.1;
+
+    console.log(
+      "[ARB] calculateArbitrageOpportunities called with",
+      eventsData ? eventsData.length : 0,
+      "events, minProfitPct =",
+      safeMinProfit
+    );
+
+    const allCandidates: MaxProfitPick[] = [];
+    let totalMarkets = 0;
+    let marketsWith2Outcomes = 0;
+    let debugMarketLogsRemaining = 5; // only spam a few markets
+
+    // 🔹 NEW: basic NFL team "form" ratings from recent scores
+    let teamFormStats = new Map<string, TeamFormStats>();
+    try {
+      teamFormStats = await this.getNflTeamFormStats();
+    } catch (err) {
+      console.error("[ARB] Error loading team form stats, continuing without:", err);
+    }
+
+    for (const eventWrapper of eventsData || []) {
+      if (!eventWrapper || !eventWrapper.event || !eventWrapper.markets) continue;
+
+      const eventInfo = eventWrapper.event;
+
+      // Compute a simple "form signal" for this matchup if we have enough data
+      const homeForm = teamFormStats.get(eventInfo.homeTeam);
+      const awayForm = teamFormStats.get(eventInfo.awayTeam);
+
+      let matchupFormSignal = 0; // -1 = away much stronger, +1 = home much stronger, 0 = even/unknown
+      if (
+        eventInfo.sport === "americanfootball_nfl" &&
+        homeForm &&
+        awayForm &&
+        homeForm.games >= 3 &&
+        awayForm.games >= 3
+      ) {
+        const marginDiff = homeForm.avgMargin - awayForm.avgMargin; // positive -> home outscoring opps more
+        // Cap at about 2 TDs in either direction to avoid insane values
+        const capped = Math.max(-14, Math.min(14, marginDiff));
+        matchupFormSignal = capped / 14; // [-1, 1]
+      }
+
+      for (const market of eventWrapper.markets || []) {
+        totalMarkets++;
+
+        const allOutcomes = market.outcomes || [];
+
+        // DEBUG: show raw outcomes + odds shape for a few markets
+        if (debugMarketLogsRemaining > 0) {
+          const rawOutcomesDebug = allOutcomes.map((o: any) => ({
+            label: (o as any).label || o.name || (o as any).id,
+            hasOdds: Array.isArray(o.odds) && o.odds.length > 0,
+            oddsCount: Array.isArray(o.odds) ? o.odds.length : 0,
+            oddsSample: (o.odds || []).slice(0, 2).map((od: any) => ({
+              sportsbook: od.sportsbook,
+              price: od.price,
+              decimal: od.decimal,
+            })),
+          }));
+          console.log("[ARB DEBUG] market raw outcomes", {
+            eventId: eventInfo.id,
+            homeTeam: eventInfo.homeTeam,
+            awayTeam: eventInfo.awayTeam,
+            marketType: market.type,
+            description: market.description,
+            outcomeCount: allOutcomes.length,
+            rawOutcomesDebug,
+          });
+        }
+
+        // 1) Filter to outcomes that actually have odds
+        const rawOutcomes = allOutcomes.filter(
+          (o: any) => o && Array.isArray(o.odds) && o.odds.length > 0
+        );
+
+        if (debugMarketLogsRemaining > 0) {
+          console.log("[ARB DEBUG] market filtered outcomes", {
+            eventId: eventInfo.id,
+            marketType: market.type,
+            description: market.description,
+            filteredCount: rawOutcomes.length,
+          });
+        }
+
+        if (rawOutcomes.length < 2) {
+          if (debugMarketLogsRemaining > 0) {
+            console.log("[ARB DEBUG] SKIP: fewer than 2 outcomes with odds", {
+              eventId: eventInfo.id,
+              marketType: market.type,
+              description: market.description,
+            });
+            debugMarketLogsRemaining--;
+          }
+          continue;
+        }
+
+        // 2) For each outcome, pick the best decimal price across all sportsbooks
+        const bestOutcomeOdds: Array<{
+          name: string;
+          sportsbook: string;
+          american: string;
+          decimal: number;
+        }> = [];
+
+        rawOutcomes.forEach((outcome: any, index: number) => {
+          let bestDecimal = 0;
+          let bestSportsbook = "";
+          let bestPriceStr = "";
+
+          for (const odd of outcome.odds || []) {
+            const decimal = Number(odd.decimal);
+            if (!isFinite(decimal) || decimal <= 1.01) {
+              if (debugMarketLogsRemaining > 0) {
+                console.log("[ARB DEBUG] skipping odd due to bad decimal", {
+                  outcomeLabel:
+                    (outcome as any).label ||
+                    outcome.name ||
+                    (outcome as any).id,
+                  sportsbook: odd.sportsbook,
+                  price: odd.price,
+                  decimal,
+                });
+              }
+              continue;
+            }
+
+            if (decimal > bestDecimal) {
+              bestDecimal = decimal;
+              bestSportsbook = odd.sportsbook;
+              bestPriceStr = odd.price;
             }
           }
-          
-          if (bestPrice.sportsbook) {
-            bestPrices[outcome.name] = bestPrice;
+
+          if (bestSportsbook) {
+            const baseName =
+              (outcome as any).label ||
+              outcome.name ||
+              (outcome as any).id ||
+              `Outcome ${index + 1}`;
+
+            // Ensure outcome names are unique per market
+            let name = baseName;
+            let suffix = 2;
+            while (bestOutcomeOdds.some((o) => o.name === name)) {
+              name = `${baseName} #${suffix}`;
+              suffix++;
+            }
+
+            bestOutcomeOdds.push({
+              name,
+              sportsbook: bestSportsbook,
+              american: bestPriceStr,
+              decimal: bestDecimal,
+            });
+          } else if (debugMarketLogsRemaining > 0) {
+            console.log("[ARB DEBUG] SKIP outcome: no valid decimal odds", {
+              outcomeLabel:
+                (outcome as any).label ||
+                outcome.name ||
+                (outcome as any).id ||
+                `Outcome ${index + 1}`,
+            });
           }
+        });
+
+        if (bestOutcomeOdds.length < 2) {
+          if (debugMarketLogsRemaining > 0) {
+            console.log(
+              "[ARB DEBUG] SKIP: fewer than 2 outcomes with valid prices",
+              {
+                eventId: eventInfo.id,
+                marketType: market.type,
+                description: market.description,
+                bestOutcomeCount: bestOutcomeOdds.length,
+                bestOutcomeOdds,
+              }
+            );
+            debugMarketLogsRemaining--;
+          }
+          continue;
         }
-        
-        // Check if arbitrage exists
-        const outcomes = Object.keys(bestPrices);
-        if (outcomes.length >= 2) {
-          const sum = outcomes.reduce((s, outcome) => s + (1 / bestPrices[outcome].decimal), 0);
-          
-          if (sum < 0.98) { // Arbitrage exists (allowing for 2% buffer)
-            const profitPct = ((1 / sum) - 1) * 100;
-            
-            if (profitPct >= minProfitPct) {
-              const bankroll = 10000; // $10k default
-              const legs = outcomes.map(outcome => {
-                const stakeFraction = (1 / bestPrices[outcome].decimal) / sum;
-                const stake = Math.round(bankroll * stakeFraction);
-                
-                return {
-                  outcome,
-                  sportsbook: this.formatSportsbookName(bestPrices[outcome].sportsbook),
-                  odds: this.formatOdds(bestPrices[outcome].price),
-                  stake
-                };
-              });
-              
-              const lockedProfit = bankroll * ((1 / sum) - 1);
-              
-              opportunities.push({
-                event: {
-                  id: event.eventId,
-                  homeTeam: event.homeTeam,
-                  awayTeam: event.awayTeam,
-                  sport: event.sport,
-                  league: event.league,
-                  startTime: new Date(event.startTime).toLocaleString()
-                },
-                market: {
-                  type: market.type.toUpperCase(),
-                  description: market.description
-                },
-                legs,
-                profitPct: Math.round(profitPct * 100) / 100,
-                lockedProfit: Math.round(lockedProfit * 100) / 100,
-                validityWindow: 300, // 5 minutes
-                confidenceScore: Math.min(0.95, 0.7 + (profitPct / 10)) // Higher confidence for higher profit
-              });
+
+        marketsWith2Outcomes++;
+
+        // 3) Classic arbitrage math: sum of implied probs, then "edge"
+        const impliedProbs = bestOutcomeOdds.map((o) => 1 / o.decimal);
+        const sumImplied = impliedProbs.reduce((acc, p) => acc + p, 0);
+        const profitPct = (1 / sumImplied - 1) * 100; // >0 = true arb, <0 = house edge
+
+        if (allCandidates.length < 5) {
+          console.log("[ARB] sample market", {
+            eventId: eventInfo.id,
+            marketType: market.type,
+            description: market.description,
+            outcomeCount: bestOutcomeOdds.length,
+            outcomeNames: bestOutcomeOdds.map((o) => o.name),
+            sum: sumImplied,
+            profitPct,
+          });
+        }
+
+        // 4) Stake sizing using standard hedged allocation
+        const bankroll = 10000;
+        const stakes = bestOutcomeOdds.map((o) => {
+          const weight = (1 / o.decimal) / sumImplied; // fraction of bankroll on this leg
+          const stake = bankroll * weight;
+          return Math.round(stake * 100) / 100; // round to cents
+        });
+
+        const totalStake = stakes.reduce((a, b) => a + b, 0);
+        const guaranteedReturn =
+          stakes.length > 0 ? stakes[0] * bestOutcomeOdds[0].decimal : 0;
+        const lockedProfit = guaranteedReturn - totalStake;
+
+        // 5) Confidence score:
+        //    - market "edge" (profitPct) in [-5, +5]  -> [0, 1]
+        //    - how strong the form signal is (big point diff vs opponents)
+        //    - whether the odds favorite aligns with the stronger team
+        const profitComponent = Math.max(
+          0,
+          Math.min(1, (profitPct + 5) / 10)
+        ); // 0..1
+
+        const formStrength = Math.min(1, Math.abs(matchupFormSignal)); // 0..1
+
+        let formAlignment = 0.5; // neutral default
+        if (matchupFormSignal !== 0 && bestOutcomeOdds.length === 2) {
+          const [opt1, opt2] = bestOutcomeOdds;
+          const homeName = eventInfo.homeTeam.toLowerCase();
+          const awayName = eventInfo.awayTeam.toLowerCase();
+
+          // Lower decimal => shorter odds => favorite
+          const favorite =
+            opt1.decimal <= opt2.decimal ? opt1 : opt2;
+          const favoriteName = favorite.name.toLowerCase();
+
+          const expectedFavorite =
+            matchupFormSignal > 0
+              ? homeName
+              : matchupFormSignal < 0
+              ? awayName
+              : null;
+
+          if (expectedFavorite) {
+            if (favoriteName.includes(expectedFavorite)) {
+              // Market favorite matches the recently-stronger team
+              formAlignment = 1;
+            } else {
+              // Market is favoring the team with worse recent form
+              formAlignment = 0.2;
             }
           }
         }
+
+        const combinedScore =
+          0.5 * profitComponent + 0.3 * formAlignment + 0.2 * formStrength;
+        const confidenceScore = Math.round(combinedScore * 100);
+
+        const legs = bestOutcomeOdds.map((o, idx) => ({
+          outcome: o.name,
+          sportsbook: this.formatSportsbookName(o.sportsbook),
+          odds: o.american,
+          stake: stakes[idx],
+        }));
+
+        allCandidates.push({
+          event: {
+            id: eventInfo.id,
+            homeTeam: eventInfo.homeTeam,
+            awayTeam: eventInfo.awayTeam,
+            sport: eventInfo.sport,
+            league: eventInfo.league,
+            startTime: new Date(eventInfo.startTime).toLocaleString(),
+          },
+          market: {
+            type: (market.type || "").toUpperCase(),
+            description: market.description,
+          },
+          legs,
+          profitPct,
+          validityWindow: 120,
+          confidenceScore,
+          lockedProfit,
+        });
       }
     }
-    
-    return opportunities;
+
+    console.log(
+      "[ARB] markets scanned:",
+      totalMarkets,
+      "with >=2 valid outcomes:",
+      marketsWith2Outcomes,
+      "candidates built:",
+      allCandidates.length
+    );
+
+    if (allCandidates.length === 0) {
+      console.log("[ARB] No candidates built at all");
+      return [];
+    }
+
+    // --- "Safest/value slice" selection logic ---
+
+    // 1) Markets with true arb or positive edge >= safeMinProfit
+    const positive = allCandidates.filter(
+      (c) => c.profitPct >= safeMinProfit
+    );
+
+    // 2) "Safer" markets: small house edge, cap at -5% so we don't show trash
+    const negative = allCandidates.filter(
+      (c) => c.profitPct < safeMinProfit && c.profitPct >= -5
+    );
+
+    positive.sort((a, b) => b.profitPct - a.profitPct);
+    negative.sort((a, b) => b.profitPct - a.profitPct);
+
+    const combined = [...positive, ...negative];
+
+    if (combined.length === 0) {
+      // If literally nothing is better than -5%, just return the top 30 by edge.
+      const sortedByProfit = [...allCandidates].sort(
+        (a, b) => b.profitPct - a.profitPct
+      );
+      console.log(
+        "[ARB] no candidates above -5% edge; returning top",
+        Math.min(30, sortedByProfit.length),
+        "by profitPct"
+      );
+      return sortedByProfit.slice(0, 30);
+    }
+
+    console.log("[ARB] combined positive + safest/value markets", {
+      positiveCount: positive.length,
+      nearEvenCount: negative.length,
+      maxProfitPct: combined[0].profitPct,
+      minProfitPct: combined[combined.length - 1].profitPct,
+    });
+
+    // Return at most 30 of the "best slice" of the board
+    return combined.slice(0, 30);
   }
+
+
+
 
   /**
    * Convert American odds to decimal odds

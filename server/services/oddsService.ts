@@ -53,15 +53,24 @@ class OddsService {
 
       // Make actual API calls to The Odds API
       const { data: realOdds, creditUsage } = await this.fetchFromOddsAPI(options);
-      
+
+      // 🔍 TEMP DEBUG: fetch and log a small sample of NFL scores/stats
+      await this.debugFetchNflScores();
+
       await this.processOddsData(realOdds);
       
-      // Store cost record
+      // Store cost record as an API cost in USD
       await storage.createCostRecord({
-        creditsUsed: creditUsage.used,
-        operation: "odds_fetch",
-        details: { leagues: options.leagues || [], eventsProcessed: realOdds.length }
+        category: "api",                            // required: api | compute | storage | misc
+        amount: creditUsage.used != null ? creditUsage.used.toFixed(2) : "0.00",
+        currency: "USD",                            // optional (default "USD"), but explicit is OK
+        metadata: {
+          operation: "odds_fetch",
+          leagues: options.leagues || [],
+          eventsProcessed: realOdds.length,
+        },
       });
+
 
       await storage.updateJobRun(job.id, {
         status: "success",
@@ -103,7 +112,7 @@ class OddsService {
       throw new Error("Odds API key not configured");
     }
 
-    const { leagues = ["basketball_nba", "americanfootball_nfl"], liveOnly = false } = options;
+    const { leagues = ["americanfootball_nfl"], liveOnly = false, maxPages = 3 } = options;
     const allOdds: OddsApiResponse[] = [];
     let totalCreditsUsed = 0;
     let remainingCredits = 500; // Default fallback
@@ -159,6 +168,44 @@ class OddsService {
         remaining: remainingCredits
       }
     };
+  }
+
+  // 🔍 Option B: helper to fetch and log a sample of NFL scores/stats
+  private async debugFetchNflScores(): Promise<void> {
+    if (!this.apiKey) {
+      console.warn("[ODDS DEBUG] No API key configured; skipping NFL scores sample.");
+      return;
+    }
+
+    const url = `${this.baseUrl}/sports/americanfootball_nfl/scores`;
+    const params = new URLSearchParams({
+      apiKey: this.apiKey,
+      daysFrom: "3",
+    });
+
+    try {
+      console.log("[ODDS DEBUG] Fetching sample NFL scores/stats...");
+      const response = await fetch(`${url}?${params.toString()}`);
+
+      if (!response.ok) {
+        console.warn(
+          "[ODDS DEBUG] Failed to fetch NFL scores sample:",
+          response.status,
+          response.statusText
+        );
+        return;
+      }
+
+      const data = await response.json();
+      const sample = Array.isArray(data) ? data.slice(0, 2) : data;
+
+      console.log(
+        "[ODDS DEBUG] NFL scores sample:",
+        JSON.stringify(sample, null, 2)
+      );
+    } catch (err) {
+      console.error("[ODDS DEBUG] Error while fetching NFL scores sample:", err);
+    }
   }
 
   private async simulateOddsData(): Promise<OddsApiResponse[]> {

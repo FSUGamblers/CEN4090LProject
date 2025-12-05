@@ -64,18 +64,43 @@ export async function registerRoutes(app: Express): Promise<Server> {
         storage.getJobRuns(),
       ]);
 
-      const activeOpportunities = arbitrageOpportunities.length;
-      const trackedBets = userBets.filter(bet => bet.isTracked).length;
-      const avgProfit = arbitrageOpportunities.length > 0 
-        ? arbitrageOpportunities.reduce((sum, opp) => sum + Number(opp.expectedProfitPct), 0) / arbitrageOpportunities.length
-        : 0;
+      // Helper to normalize whatever field we're using for "edge"
+      const normalizeEdge = (opp: any): number => {
+        const raw =
+          typeof opp.expectedProfitPct !== 'undefined'
+            ? Number(opp.expectedProfitPct)
+            : typeof opp.profitPct !== 'undefined'
+            ? Number(opp.profitPct)
+            : 0;
 
-      // Get today's PnL
+        return Number.isFinite(raw) ? raw : 0;
+      };
+
+      // "Safe" window for value / hedged opportunities (same spirit as calculateArbitrageOpportunities)
+      const SAFE_MIN_EDGE = -5; // -5% house edge cutoff for "not trash"
+
+      const safeOpportunities = (arbitrageOpportunities || []).filter(
+        (opp: any) => normalizeEdge(opp) >= SAFE_MIN_EDGE
+      );
+
+      const activeOpportunities = safeOpportunities.length;
+
+      const trackedBets = (userBets || []).filter((bet: any) => bet.isTracked).length;
+
+      const avgProfit =
+        safeOpportunities.length > 0
+          ? safeOpportunities.reduce(
+              (sum: number, opp: any) => sum + normalizeEdge(opp),
+              0
+            ) / safeOpportunities.length
+          : 0;
+
+      // Get today's PnL (unchanged)
       const today = new Date();
       today.setHours(0, 0, 0, 0);
       const tomorrow = new Date(today);
       tomorrow.setDate(tomorrow.getDate() + 1);
-      
+
       const pnlSummary = await storage.getPnlSummary(today, tomorrow);
       const dailyPnl = (pnlSummary.realized || 0) + (pnlSummary.unrealized || 0);
 
@@ -84,13 +109,15 @@ export async function registerRoutes(app: Express): Promise<Server> {
         avgProfit: avgProfit.toFixed(1),
         trackedBets,
         dailyPnl,
-        hedgeAlerts: userBets.filter(bet => bet.isTracked).length, // Simplified
+        // For now, just mirror trackedBets as a simple hedgeAlerts proxy
+        hedgeAlerts: trackedBets,
       });
     } catch (error) {
-      console.error("Error fetching dashboard stats:", error);
-      res.status(500).json({ message: "Failed to fetch dashboard stats" });
+      console.error('Error fetching dashboard stats:', error);
+      res.status(500).json({ message: 'Failed to fetch dashboard stats' });
     }
   });
+
 
   // Sports routes
   app.get('/api/sports', isAuthenticated, async (req, res) => {
@@ -303,7 +330,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
     }
   });
 
-  // POST /api/scan/arbs - Execute arbitrage scan after user confirmation  
+  // POST /api/scan/arbs - Execute arbitrage scan after user confirmation
   app.post('/api/scan/arbs', isAuthenticated, async (req: any, res) => {
     try {
       const requestSchema = z.object({
@@ -312,36 +339,75 @@ export async function registerRoutes(app: Express): Promise<Server> {
         regions: z.array(z.string()).optional(),
         markets: z.array(z.string()).optional(),
         minProfitPct: z.number().optional(),
-        confirmed: z.boolean().refine(val => val === true, "User confirmation is required")
+        // NEW: allow caller to say "only use cached odds from DB"
+        useCacheOnly: z.boolean().optional(),
+        confirmed: z
+          .boolean()
+          .refine((val) => val === true, "User confirmation is required"),
       });
 
-      const scanRequest = requestSchema.parse(req.body) as EstimateRequest & { confirmed: boolean };
+      // Parse and separate the confirmation flag from the scan parameters
+      const parsed = requestSchema.parse(req.body) as {
+        confirmed: boolean;
+        useCacheOnly?: boolean;
+      } & EstimateRequest;
+
+      const { confirmed, ...scanRequest } = parsed;
       const userId = req.user.claims.sub;
-      
-      await auditService.log(userId, 'arbitrage_scan_confirmed', 'system', null, scanRequest);
-      
-      const results = await arbitrageService.scanArbitrageOpportunities(scanRequest, userId);
-      
+
+      // Log the confirmed scan request (including useCacheOnly + filters)
+      await auditService.log(
+        userId,
+        'arbitrage_scan_confirmed',
+        'system',
+        null,
+        {
+          ...scanRequest,
+          confirmed,
+        }
+      );
+
+      // Delegate to the service:
+      //  - scanRequest now includes everything (states, sports, markets, minProfitPct, useCacheOnly)
+      //  - arbitrageService.scanArbitrageOpportunities is responsible for:
+      //      * deciding whether to reuse cached odds from storage (when useCacheOnly === true)
+      //      * running calculateArbitrageOpportunities
+      //      * returning a ranked list of "value / safer" opportunities
+      const results = await arbitrageService.scanArbitrageOpportunities(
+        scanRequest as EstimateRequest & { useCacheOnly?: boolean },
+        userId
+      );
+
+      // IMPORTANT: do NOT re-filter here by "positive EV" or minProfit.
+      // We trust the service's `rankedOpportunities` slice as the authoritative
+      // "best / safest" board.
+      const rankedOpportunities = results.rankedOpportunities ?? [];
+      const maxProfitPick =
+        results.maxProfitPick ?? rankedOpportunities[0] ?? null;
+
       res.json({
         success: true,
         ...results,
+        rankedOpportunities,
+        maxProfitPick,
         timestamp: new Date().toISOString(),
-        cacheExpiresAt: new Date(Date.now() + 5 * 60 * 1000).toISOString() // 5 minutes - matches opportunity expiry
+        // 5 minutes cache window – matches opportunity expiry
+        cacheExpiresAt: new Date(Date.now() + 5 * 60 * 1000).toISOString(),
       });
-      
     } catch (error) {
       console.error("Error executing arbitrage scan:", error);
-      
+
       if (error instanceof z.ZodError) {
-        return res.status(400).json({ 
+        return res.status(400).json({
           message: "Invalid request parameters",
-          errors: error.errors 
+          errors: error.errors,
         });
       }
-      
+
       res.status(500).json({ message: "Failed to execute arbitrage scan" });
     }
   });
+
 
   // GET /api/state-map - Get current state-to-sportsbooks mapping
   app.get('/api/state-map', isAuthenticated, async (req: any, res) => {
@@ -714,6 +780,28 @@ app.post('/api/n8n/jobs/:name/run', requireBearerOrReject, async (req: any, res)
     } catch (error) {
       console.error("Error confirming placement:", error);
       res.status(500).json({ message: "Failed to confirm placement" });
+    }
+  });
+
+  // GET /api/arbitrage/opportunities - currently active value opportunities
+  app.get("/api/arbitrage/opportunities", isAuthenticated, async (req: any, res) => {
+    try {
+      // This uses your existing storage method; no new options needed.
+      const opportunities = await storage.getArbitrageOpportunities();
+
+      const now = new Date();
+
+      // Keep only non-expired ones if expiresAt exists
+      const active = (opportunities || []).filter((opp: any) => {
+        if (!opp.expiresAt) return true;
+        return new Date(opp.expiresAt) > now;
+      });
+
+      // For now, just pass them through; the frontend will normalize.
+      res.json(active);
+    } catch (error) {
+      console.error("Error fetching active arbitrage/value opportunities:", error);
+      res.status(500).json({ message: "Failed to fetch opportunities" });
     }
   });
 

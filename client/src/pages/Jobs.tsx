@@ -80,8 +80,8 @@ export default function Jobs() {
 
   const triggerOddsIngestMutation = useMutation({
     mutationFn: async () => {
-      await apiRequest("POST", "/api/ingest/odds:run", {
-        leagues: [],
+      await apiRequest("POST", "/api/ingest/odds/run", {
+        leagues: ["americanfootball_nfl"],
         live_only: false,
         max_pages: 5
       });
