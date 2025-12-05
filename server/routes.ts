@@ -18,6 +18,7 @@ import {
 import { oddsService } from "./services/oddsService";
 import { arbitrageService, type EstimateRequest } from "./services/arbitrageService";
 import { jobScheduler } from "./services/jobScheduler";
+import { computeHedgeCandidates } from "./services/hedgeService";
 import { featureFlagService } from "./services/featureFlagService";
 import { auditService } from "./services/auditService";
 // Lightweight bearer guard for machine-to-machine calls (e.g., n8n)
@@ -58,7 +59,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
   app.get('/api/dashboard/stats', isAuthenticated, async (req: any, res) => {
     try {
       const [arbitrageOpportunities, userBets, jobRuns] = await Promise.all([
-        storage.getArbitrageOpportunities(),
+        storage.getArbitrageOpportunities({ activeOnly: true }),
         storage.getUserBets(req.user.claims.sub),
         storage.getJobRuns(),
       ]);
@@ -84,7 +85,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
 
       const activeOpportunities = safeOpportunities.length;
 
-      const trackedBets = (userBets || []).filter((bet: any) => bet.isTracked).length;
+      const trackedBets = (userBets || []).length;
 
       const avgProfit =
         safeOpportunities.length > 0
@@ -503,6 +504,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
       const betData = insertUserBetSchema.parse({
         ...req.body,
         userId: req.user.claims.sub,
+        isTracked: true,
       });
 
       const bet = await storage.createUserBet(betData);
@@ -567,6 +569,22 @@ export async function registerRoutes(app: Express): Promise<Server> {
     } catch (error) {
       console.error("Error updating bet:", error);
       res.status(500).json({ message: "Failed to update bet" });
+    }
+  });
+
+  // Hedge candidate probe (uses delayed, DB-touching engine)
+  app.get('/api/hedge/candidates', isAuthenticated, async (req: any, res) => {
+    try {
+      const bets = await storage.getUserBets(req.user.claims.sub, { status: 'open' });
+      const hedges = await computeHedgeCandidates(req.user.claims.sub, bets);
+
+      res.json({
+        betsAnalyzed: bets.length,
+        candidates: hedges,
+      });
+    } catch (error) {
+      console.error('Error computing hedge candidates:', error);
+      res.status(500).json({ message: 'Failed to compute hedge candidates' });
     }
   });
 

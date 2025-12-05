@@ -1,4 +1,5 @@
 import React from "react";
+import { useMemo } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
@@ -17,7 +18,14 @@ import {
   Filter,
   Bell
 } from "lucide-react";
-import type { DashboardStats, ArbitrageOpportunityDisplay, HedgeAlertDisplay, JobStatusDisplay, StateAccessDisplay, ExpenseSummary } from "@/types";
+import type {
+  DashboardStats,
+  ArbitrageOpportunityDisplay,
+  HedgeAlertDisplay,
+  JobStatusDisplay,
+  StateAccessDisplay,
+  ExpenseSummary,
+} from "@/types";
 
 // --- Arbitrage scan types from POST /api/scan/arbs ---
 
@@ -68,6 +76,38 @@ type ArbsScanResponse = {
   cacheExpiresAt: string;
 };
 
+type ManualBet = {
+  id: string;
+  sport: string;
+  league?: string | null;
+  homeTeam?: string | null;
+  awayTeam?: string | null;
+  marketType: string;
+  selection: string;
+  sportsbook: string;
+  oddsAmerican: number;
+  stake: string;
+  status: "open" | "won" | "lost" | "void" | "settled";
+  createdAt: string;
+};
+
+type HedgeCandidatesResponse = {
+  betsAnalyzed: number;
+  candidates: any[];
+};
+
+type StateMapResponse = {
+  sportsbooks: { id: string; name: string; supportedStates?: string[] }[];
+  computeLocations: { id: string; stateCode: string; status: string }[];
+};
+
+function americanProfit(oddsAmerican: number, stake: number) {
+  if (oddsAmerican > 0) {
+    return (oddsAmerican / 100) * stake;
+  }
+  return (100 / Math.abs(oddsAmerican)) * stake;
+}
+
 export default function Dashboard() {
   const { toast } = useToast();
 
@@ -77,11 +117,58 @@ export default function Dashboard() {
   });
   const netPnlToday = stats?.dailyPnl ?? 0;
 
+  // Bet tracker snapshot
+  const { data: bets = [], isLoading: betsLoading } = useQuery<ManualBet[]>({
+    queryKey: ["/api/bets"],
+  });
+
+  const pnlSummary = useMemo(() => {
+    return bets.reduce(
+      (acc, bet) => {
+        const stake = Number(bet.stake) || 0;
+        const odds = Number(bet.oddsAmerican) || 0;
+
+        acc.totalStaked += stake;
+
+        if (bet.status === "open") {
+          acc.unrealizedExposure += stake;
+          acc.potentialUpside += americanProfit(odds, stake);
+        }
+
+        if (bet.status === "won") {
+          acc.realized += americanProfit(odds, stake);
+        } else if (bet.status === "lost") {
+          acc.realized -= stake;
+        }
+
+        acc.roi = acc.totalStaked > 0 ? (acc.realized / acc.totalStaked) * 100 : 0;
+
+        return acc;
+      },
+      {
+        realized: 0,
+        unrealizedExposure: 0,
+        potentialUpside: 0,
+        totalStaked: 0,
+        roi: 0,
+      },
+    );
+  }, [bets]);
+
   // 2) Shared active opportunities from backend (any page / previous scans)
   const { data: activeOpportunities = [], isLoading: activeOppLoading } =
     useQuery<ArbitrageOpportunity[]>({
       queryKey: ["/api/arbitrage/opportunities"],
     });
+
+  const { data: hedgeResponse, isLoading: hedgeLoading } =
+    useQuery<HedgeCandidatesResponse>({
+      queryKey: ["/api/hedge/candidates"],
+    });
+
+  const { data: stateMap } = useQuery<StateMapResponse>({
+    queryKey: ["/api/state-map"],
+  });
 
   // 3) Arbitrage scan state (POST /api/scan/arbs) – local, for fresh runs
   const [scanResult, setScanResult] = React.useState<ArbsScanResponse | null>(null);
@@ -144,6 +231,18 @@ export default function Dashboard() {
 
   const profitableOpportunities: ArbitrageOpportunity[] =
     baseOpportunities.filter((opp) => opp.profitPct > 0);
+
+  const hedgeAlerts: HedgeAlertDisplay[] = useMemo(() => {
+    if (!hedgeResponse?.candidates) return [];
+
+    return hedgeResponse.candidates.map((candidate: any, index: number) => ({
+      id: candidate.id || `hedge-${index}`,
+      betDescription: candidate.betDescription || candidate.description || "Hedge review",
+      suggestion: candidate.suggestion || candidate.message || "Review exposure and consider balancing positions.",
+      type: candidate.type || "info",
+      action: candidate.action || "Review",
+    }));
+  }, [hedgeResponse]);
 
   const lastScanTimeLabel =
     scanResult?.timestamp
@@ -235,6 +334,81 @@ export default function Dashboard() {
           isLoading={statsLoading}
         />
       </div>
+
+      <Card>
+        <CardHeader>
+          <div className="flex items-center justify-between">
+            <CardTitle>Bet tracker snapshot</CardTitle>
+            <Badge variant="outline">Linked to Hedge Center</Badge>
+          </div>
+        </CardHeader>
+        <CardContent className="space-y-4">
+          {betsLoading ? (
+            <div className="space-y-2">
+              {[1, 2].map((i) => (
+                <div key={i} className="h-10 bg-muted animate-pulse rounded" />
+              ))}
+            </div>
+          ) : bets.length === 0 ? (
+            <p className="text-sm text-muted-foreground">
+              No manual bets tracked yet. Add entries in the Hedge Center to see PnL and hedge coverage here.
+            </p>
+          ) : (
+            <div className="space-y-4">
+              <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+                <div>
+                  <p className="text-xs text-muted-foreground">Realized PnL</p>
+                  <p className={`text-2xl font-semibold ${pnlSummary.realized >= 0 ? "text-emerald-600" : "text-red-600"}`}>
+                    {pnlSummary.realized >= 0 ? "+" : ""}${pnlSummary.realized.toFixed(2)}
+                  </p>
+                </div>
+                <div>
+                  <p className="text-xs text-muted-foreground">Open exposure</p>
+                  <p className="text-2xl font-semibold">${pnlSummary.unrealizedExposure.toFixed(2)}</p>
+                </div>
+                <div>
+                  <p className="text-xs text-muted-foreground">Potential upside</p>
+                  <p className="text-2xl font-semibold text-emerald-600">${pnlSummary.potentialUpside.toFixed(2)}</p>
+                </div>
+              </div>
+
+              <div className="overflow-x-auto">
+                <table className="w-full text-sm">
+                  <thead className="text-left text-muted-foreground">
+                    <tr>
+                      <th className="p-2">Selection</th>
+                      <th className="p-2">Book</th>
+                      <th className="p-2">Odds</th>
+                      <th className="p-2">Stake</th>
+                      <th className="p-2">Status</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y">
+                    {bets.slice(0, 4).map((bet) => (
+                      <tr key={bet.id} className="align-top">
+                        <td className="p-2 font-medium">
+                          {bet.selection}
+                          <div className="text-xs text-muted-foreground">
+                            {bet.homeTeam && bet.awayTeam ? `${bet.homeTeam} vs ${bet.awayTeam}` : bet.sport}
+                          </div>
+                        </td>
+                        <td className="p-2">{bet.sportsbook}</td>
+                        <td className="p-2">{bet.oddsAmerican > 0 ? `+${bet.oddsAmerican}` : bet.oddsAmerican}</td>
+                        <td className="p-2">${Number(bet.stake).toFixed(2)}</td>
+                        <td className="p-2">
+                          <Badge variant={bet.status === "open" ? "outline" : bet.status === "won" ? "default" : "destructive"}>
+                            {bet.status}
+                          </Badge>
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          )}
+        </CardContent>
+      </Card>
 
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-8">
         {/* Value Opportunities */}
@@ -346,11 +520,20 @@ export default function Dashboard() {
             <CardHeader>
               <CardTitle>Hedge Alerts</CardTitle>
             </CardHeader>
-            <CardContent>
-              <p className="text-sm text-muted-foreground">
-                No hedge alerts yet. This will update when real hedge data is
-                available.
-              </p>
+            <CardContent className="space-y-3">
+              {hedgeLoading ? (
+                <div className="space-y-2">
+                  {[1, 2].map((i) => (
+                    <div key={i} className="h-12 bg-muted animate-pulse rounded" />
+                  ))}
+                </div>
+              ) : hedgeAlerts.length === 0 ? (
+                <p className="text-sm text-muted-foreground">
+                  No hedge candidates surfaced from your open bets yet. Add or update bets in the Hedge Center to trigger analysis.
+                </p>
+              ) : (
+                hedgeAlerts.map((alert) => <HedgeAlert key={alert.id} alert={alert} />)
+              )}
             </CardContent>
           </Card>
 
@@ -397,10 +580,34 @@ export default function Dashboard() {
                 </Button>
               </div>
             </CardHeader>
-            <CardContent>
-              <p className="text-sm text-muted-foreground">
-                No state access metrics yet.
-              </p>
+            <CardContent className="space-y-2">
+              {stateMap ? (
+                <>
+                  <p className="text-sm">
+                    {stateMap.sportsbooks.length} sportsbooks configured with
+                    {" "}
+                    {stateMap.sportsbooks.reduce(
+                      (count, book) => count + (book.supportedStates?.length || 0),
+                      0,
+                    )}
+                    {" "}
+                    total state entries.
+                  </p>
+                  <div className="flex flex-wrap gap-2 text-xs text-muted-foreground">
+                    {stateMap.sportsbooks.slice(0, 6).map((book) => (
+                      <Badge key={book.id} variant="outline">
+                        {book.name}
+                        {book.supportedStates?.length ? ` • ${book.supportedStates.length} states` : ""}
+                      </Badge>
+                    ))}
+                    {stateMap.sportsbooks.length > 6 && (
+                      <span className="text-xs text-muted-foreground">+{stateMap.sportsbooks.length - 6} more</span>
+                    )}
+                  </div>
+                </>
+              ) : (
+                <p className="text-sm text-muted-foreground">Loading state access…</p>
+              )}
             </CardContent>
           </Card>
         </div>
