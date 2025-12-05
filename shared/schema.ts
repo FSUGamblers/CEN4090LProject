@@ -160,18 +160,28 @@ export const arbitrageOpportunities = pgTable("arbitrage_opportunities", {
 export const userBets = pgTable("user_bets", {
   id: varchar("id").primaryKey().default(sql`gen_random_uuid()`),
   userId: varchar("user_id").notNull().references(() => users.id),
-  eventId: varchar("event_id").notNull().references(() => events.id),
-  marketId: varchar("market_id").notNull().references(() => markets.id),
-  sportsbookId: varchar("sportsbook_id").notNull().references(() => sportsbooks.id),
-  outcomeId: varchar("outcome_id").notNull(),
+  sport: varchar("sport").notNull(),
+  league: varchar("league"),
+  eventId: varchar("event_id").references(() => events.id),
+  homeTeam: varchar("home_team"),
+  awayTeam: varchar("away_team"),
+  marketType: varchar("market_type").notNull(),
+  selection: varchar("selection").notNull(),
+  sportsbook: varchar("sportsbook").notNull(),
+  oddsAmerican: integer("odds_american").notNull(),
   stake: decimal("stake", { precision: 12, scale: 2 }).notNull(),
-  priceAtBet: decimal("price_at_bet", { precision: 10, scale: 4 }).notNull(),
+  status: varchar("status").notNull().default("open"), // open|won|lost|void|settled
   notes: text("notes"),
+  // Legacy fields retained for compatibility with earlier features
+  marketId: varchar("market_id").references(() => markets.id),
+  outcomeId: varchar("outcome_id"),
+  sportsbookId: varchar("sportsbook_id").references(() => sportsbooks.id),
+  priceAtBet: decimal("price_at_bet", { precision: 10, scale: 4 }),
   currentCashout: decimal("current_cashout", { precision: 12, scale: 2 }),
-  settlement: varchar("settlement").default("pending"), // pending|won|lost|void|cashout
   returns: decimal("returns", { precision: 12, scale: 2 }),
   isTracked: boolean("is_tracked").default(false),
   createdAt: timestamp("created_at").defaultNow(),
+  updatedAt: timestamp("updated_at").defaultNow(),
 });
 
 // Hedge Suggestions
@@ -351,6 +361,7 @@ export const insertArbitrageOpportunitySchema = createInsertSchema(arbitrageOppo
 export const insertUserBetSchema = createInsertSchema(userBets).omit({
   id: true,
   createdAt: true,
+  updatedAt: true,
 });
 
 export const insertHedgeSuggestionSchema = createInsertSchema(hedgeSuggestions).omit({
