@@ -109,6 +109,7 @@ export interface IStorage {
     live?: boolean;
     stateCode?: string;
     sportId?: string;
+    activeOnly?: boolean;
   }): Promise<ArbitrageOpportunity[]>;
   createArbitrageOpportunity(opportunity: InsertArbitrageOpportunity): Promise<ArbitrageOpportunity>;
   deleteExpiredArbitrageOpportunities(): Promise<void>;
@@ -176,6 +177,15 @@ export interface IStorage {
     homeTeam?: Team;
     awayTeam?: Team;
   }>>;
+
+  getEventWithDetails(eventId: string): Promise<
+    (Event & {
+      sport: Sport;
+      league: League;
+      homeTeam?: Team;
+      awayTeam?: Team;
+    }) | undefined
+  >;
 
   // Get quotes with full context for arbitrage calculations
   getQuotesWithContext(filters?: {
@@ -379,20 +389,26 @@ export class DatabaseStorage implements IStorage {
     live?: boolean;
     stateCode?: string;
     sportId?: string;
+    activeOnly?: boolean;
   }): Promise<ArbitrageOpportunity[]> {
     let query = db.select().from(arbitrageOpportunities);
-    
-    if (filters) {
-      const conditions = [];
-      if (filters.minProfit) {
-        conditions.push(gte(arbitrageOpportunities.expectedProfitPct, filters.minProfit.toString()));
-      }
-      
-      if (conditions.length > 0) {
-        query = query.where(and(...conditions));
-      }
+
+    const conditions = [] as any[];
+
+    if (filters?.minProfit) {
+      conditions.push(
+        gte(arbitrageOpportunities.expectedProfitPct, filters.minProfit.toString())
+      );
     }
-    
+
+    if (filters?.activeOnly) {
+      conditions.push(gte(arbitrageOpportunities.expiresAt, new Date()));
+    }
+
+    if (conditions.length > 0) {
+      query = query.where(and(...conditions));
+    }
+
     return await query.orderBy(desc(arbitrageOpportunities.expectedProfitPct));
   }
 
@@ -410,11 +426,11 @@ export class DatabaseStorage implements IStorage {
   // User bet operations
   async getUserBets(userId: string, filters?: { status?: string; sportId?: string }): Promise<UserBet[]> {
     let query = db.select().from(userBets).where(eq(userBets.userId, userId));
-    
+
     if (filters?.status) {
-      query = query.where(and(eq(userBets.userId, userId), eq(userBets.settlement, filters.status)));
+      query = query.where(and(eq(userBets.userId, userId), eq(userBets.status, filters.status)));
     }
-    
+
     return await query.orderBy(desc(userBets.createdAt));
   }
 
@@ -431,7 +447,7 @@ export class DatabaseStorage implements IStorage {
   async updateUserBet(id: string, updates: Partial<UserBet>): Promise<UserBet> {
     const [updated] = await db
       .update(userBets)
-      .set(updates)
+      .set({ ...updates, updatedAt: new Date() })
       .where(eq(userBets.id, id))
       .returning();
     return updated;
