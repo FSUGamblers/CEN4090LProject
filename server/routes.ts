@@ -562,7 +562,6 @@ export async function registerRoutes(app: Express): Promise<Server> {
 
       const updates = updateSchema.parse(req.body);
       const bet = await storage.updateUserBet(req.params.betId, updates);
-
       await auditService.log(req.user.claims.sub, 'bet_updated', 'user_bet', bet.id, updates);
 
       res.json(bet);
