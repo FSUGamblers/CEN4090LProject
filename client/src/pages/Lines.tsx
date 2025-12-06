@@ -25,8 +25,10 @@ export default function Lines() {
     queryClient.setQueryData(LAST_LINES_QUERY_KEY, cached);
   }, [filters, queryClient]);
 
+  const [isRefreshing, setIsRefreshing] = useState(false);
+
   // Fetch lines data
-  const { data: lines = [], isLoading, error } = useQuery<LineData[]>({
+  const { data: lines = [], isLoading, isFetching, error, refetch } = useQuery<LineData[]>({
     queryKey: ['/api/lines', filters],
     queryFn: async () => {
       const params = new URLSearchParams();
@@ -35,7 +37,7 @@ export default function Lines() {
       if (filters.marketType) params.append('market_type', filters.marketType);
       if (filters.live) params.append('live', filters.live);
       if (filters.event) params.append('event', filters.event);
-      
+
       const response = await fetch(`/api/lines?${params.toString()}`, {
         credentials: 'include'
       });
@@ -45,6 +47,8 @@ export default function Lines() {
       return response.json();
     },
     initialData: () => readCachedLines(filters)?.lines,
+    enabled: false,
+    refetchOnWindowFocus: false,
     onSuccess: (data) => {
       const cachePayload = {
         lines: data,
@@ -56,6 +60,15 @@ export default function Lines() {
       queryClient.setQueryData(LAST_LINES_QUERY_KEY, cachePayload);
     },
   });
+
+  const handleRefresh = async () => {
+    setIsRefreshing(true);
+    try {
+      await refetch();
+    } finally {
+      setIsRefreshing(false);
+    }
+  };
 
   // Get unique values for filters
   const sports = Array.from(new Set(lines?.map(line => line.market.event.sport.code) || []));
@@ -129,12 +142,15 @@ export default function Lines() {
             View all stored odds data across events and sportsbooks
           </p>
         </div>
-        <div className="flex items-center gap-2">
-          {lines && (
+        <div className="flex items-center gap-4">
+          {lines.length > 0 && (
             <span className="text-sm text-muted-foreground">
               Last updated: {new Date(Math.max(...lines.map(line => new Date(line.timestamp).getTime()))).toLocaleTimeString()}
             </span>
           )}
+          <Button onClick={handleRefresh} disabled={isFetching || isRefreshing} data-testid="button-scan-lines">
+            {isFetching || isRefreshing ? 'Scanning…' : 'Scan Lines'}
+          </Button>
         </div>
       </div>
 
@@ -302,7 +318,7 @@ export default function Lines() {
               </div>
             </CardHeader>
             <CardContent>
-              {isLoading ? (
+              {isLoading || isFetching || isRefreshing ? (
                 <div className="space-y-4">
                   {[1, 2, 3, 4, 5].map(i => (
                     <Skeleton key={i} className="h-12 w-full" />
