@@ -97,9 +97,39 @@ type HedgeCandidatesResponse = {
 };
 
 type StateMapResponse = {
-  sportsbooks: { id: string; name: string; supportedStates?: string[] }[];
-  computeLocations: { id: string; stateCode: string; status: string }[];
+  stateMap?: Record<string, unknown>;
 };
+
+type NormalizedStateMap = {
+  sportsbooks: { id: string; name: string; supportedStates: string[] }[];
+  totalStateEntries: number;
+};
+
+function normalizeStateMap(response?: StateMapResponse | null): NormalizedStateMap | null {
+  if (!response || typeof response !== "object") return null;
+
+  const rawStateMap = response.stateMap;
+  if (!rawStateMap || typeof rawStateMap !== "object") return null;
+
+  const sportsbooks = Object.entries(rawStateMap).map(([name, states], index) => {
+    const supportedStates = Array.isArray(states)
+      ? states.filter((state): state is string => typeof state === "string")
+      : [];
+
+    return {
+      id: `${name}-${index}`,
+      name,
+      supportedStates,
+    };
+  });
+
+  const totalStateEntries = sportsbooks.reduce(
+    (count, book) => count + book.supportedStates.length,
+    0,
+  );
+
+  return { sportsbooks, totalStateEntries };
+}
 
 function americanProfit(oddsAmerican: number, stake: number) {
   if (oddsAmerican > 0) {
@@ -166,9 +196,15 @@ export default function Dashboard() {
       queryKey: ["/api/hedge/candidates"],
     });
 
-  const { data: stateMap } = useQuery<StateMapResponse>({
-    queryKey: ["/api/state-map"],
-  });
+  const { data: stateMapResponse, isLoading: stateMapLoading } =
+    useQuery<StateMapResponse>({
+      queryKey: ["/api/state-map"],
+    });
+
+  const stateMap = useMemo(
+    () => normalizeStateMap(stateMapResponse),
+    [stateMapResponse],
+  );
 
   // 3) Arbitrage scan state (POST /api/scan/arbs) – local, for fresh runs
   const [scanResult, setScanResult] = React.useState<ArbsScanResponse | null>(null);
@@ -581,23 +617,20 @@ export default function Dashboard() {
               </div>
             </CardHeader>
             <CardContent className="space-y-2">
-              {stateMap ? (
+              {stateMapLoading ? (
+                <p className="text-sm text-muted-foreground">Loading state access…</p>
+              ) : !stateMap || stateMap.sportsbooks.length === 0 ? (
+                <p className="text-sm text-muted-foreground">No state access data available.</p>
+              ) : (
                 <>
                   <p className="text-sm">
-                    {stateMap.sportsbooks.length} sportsbooks configured with
-                    {" "}
-                    {stateMap.sportsbooks.reduce(
-                      (count, book) => count + (book.supportedStates?.length || 0),
-                      0,
-                    )}
-                    {" "}
-                    total state entries.
+                    {stateMap.sportsbooks.length} sportsbooks configured with {stateMap.totalStateEntries} total state entries.
                   </p>
                   <div className="flex flex-wrap gap-2 text-xs text-muted-foreground">
                     {stateMap.sportsbooks.slice(0, 6).map((book) => (
                       <Badge key={book.id} variant="outline">
                         {book.name}
-                        {book.supportedStates?.length ? ` • ${book.supportedStates.length} states` : ""}
+                        {book.supportedStates.length ? ` • ${book.supportedStates.length} states` : ""}
                       </Badge>
                     ))}
                     {stateMap.sportsbooks.length > 6 && (
@@ -605,8 +638,6 @@ export default function Dashboard() {
                     )}
                   </div>
                 </>
-              ) : (
-                <p className="text-sm text-muted-foreground">Loading state access…</p>
               )}
             </CardContent>
           </Card>
