@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useQuery, useMutation } from "@tanstack/react-query";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
@@ -79,6 +79,8 @@ interface ArbitrageScanResult {
   };
   cacheExpiresAt: string;
 }
+
+const SCAN_CACHE_KEY = "arbitrageScanCache";
 
 /* -------------------- Normalization helpers -------------------- */
 
@@ -211,6 +213,24 @@ export default function Arbitrage() {
   const [scanResults, setScanResults] = useState<ArbitrageScanResult | null>(null);
   const [lastScanTime, setLastScanTime] = useState<Date | null>(null);
 
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+
+    const cachedValue = localStorage.getItem(SCAN_CACHE_KEY);
+    if (!cachedValue) return;
+
+    try {
+      const parsed = JSON.parse(cachedValue);
+      if (parsed?.scanResults) {
+        const cachedResults = normalizeAgentResult(parsed.scanResults);
+        setScanResults(cachedResults);
+        setLastScanTime(parsed.lastScanTime ? new Date(parsed.lastScanTime) : null);
+      }
+    } catch (error) {
+      console.error("Failed to parse cached arbitrage scan", error);
+    }
+  }, []);
+
   const [filters, setFilters] = useState<ScanRequest>({
     // NOTE: The "states" here are Odds-API sports keys, which is a bit misnamed,
     // but we'll keep it as-is to avoid touching the rest of the app.
@@ -236,7 +256,18 @@ export default function Arbitrage() {
     mutationFn: async (request: ScanRequest) => runAgentScan(request),
     onSuccess: (data) => {
       setScanResults(data);
-      setLastScanTime(new Date());
+      const now = new Date();
+      setLastScanTime(now);
+
+      if (typeof window !== "undefined") {
+        localStorage.setItem(
+          SCAN_CACHE_KEY,
+          JSON.stringify({
+            scanResults: data,
+            lastScanTime: now.toISOString(),
+          })
+        );
+      }
       toast({
         title: "Agent Scan Complete",
         description: `Found ${data.allOpportunities?.length || 0} opportunities. Credits used: ${
