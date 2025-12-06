@@ -16,6 +16,7 @@ import {
   jobRuns,
   featureFlags,
   auditLogs,
+  insertCostRecordSchema,
   type User,
   type UpsertUser,
   type Sport,
@@ -469,7 +470,12 @@ export class DatabaseStorage implements IStorage {
 
   // Cost and PnL operations
   async createCostRecord(cost: InsertCostRecord): Promise<CostRecord> {
-    const [created] = await db.insert(costRecords).values(cost).returning();
+    const parsed = insertCostRecordSchema.parse({
+      ...cost,
+      category: cost.category ?? "api",
+    });
+
+    const [created] = await db.insert(costRecords).values(parsed).returning();
     return created;
   }
 
