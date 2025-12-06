@@ -8,6 +8,13 @@
       "when": 1764985970629,
       "tag": "0000_add_missing_user_bets_columns",
       "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "7",
+      "when": 1764988409231,
+      "tag": "0001_convert_user_bets_id_to_uuid",
+      "breakpoints": true
     }
   ]
 }
