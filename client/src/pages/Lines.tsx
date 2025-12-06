@@ -1,5 +1,5 @@
-import { useState } from "react";
-import { useQuery } from "@tanstack/react-query";
+import { useEffect, useState } from "react";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -9,71 +9,24 @@ import { Badge } from "@/components/ui/badge";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { Skeleton } from "@/components/ui/skeleton";
 import { useToast } from "@/hooks/use-toast";
+import { LAST_LINES_QUERY_KEY, persistCachedLines, readCachedLines } from "@/lib/linesCache";
+import type { LineData, LinesFilters } from "@/types/lines";
 import { Search, Filter, Activity, Clock, TrendingUp, Building2, MapPin } from "lucide-react";
-
-interface LineData {
-  id: string;
-  marketId: string;
-  sportsbookId: string;
-  outcomeId: string;
-  priceFormat: string;
-  priceValue: string;
-  isLive: boolean;
-  stateAvailability: string[];
-  sourceLatencyMs?: number;
-  timestamp: string;
-  sportsbook: {
-    id: string;
-    name: string;
-    logoUrl?: string;
-  };
-  market: {
-    id: string;
-    marketType: string;
-    outcomes: Array<{ id: string; label: string }>;
-    event: {
-      id: string;
-      startTime: string;
-      status: string;
-      sport: {
-        id: string;
-        name: string;
-        code: string;
-      };
-      league: {
-        id: string;
-        name: string;
-        region?: string;
-      };
-      homeTeam?: {
-        id: string;
-        name: string;
-        shortName?: string;
-      };
-      awayTeam?: {
-        id: string;
-        name: string;
-        shortName?: string;
-      };
-    };
-  };
-}
-
-interface LinesFilters {
-  sport?: string;
-  state?: string;
-  marketType?: string;
-  live?: string;
-  event?: string;
-  search?: string;
-}
 
 export default function Lines() {
   const { toast } = useToast();
+  const queryClient = useQueryClient();
   const [filters, setFilters] = useState<LinesFilters>({});
 
+  useEffect(() => {
+    const cached = readCachedLines(filters);
+    if (!cached) return;
+
+    queryClient.setQueryData(LAST_LINES_QUERY_KEY, cached);
+  }, [filters, queryClient]);
+
   // Fetch lines data
-  const { data: lines, isLoading, error } = useQuery<LineData[]>({
+  const { data: lines = [], isLoading, error } = useQuery<LineData[]>({
     queryKey: ['/api/lines', filters],
     queryFn: async () => {
       const params = new URLSearchParams();
@@ -90,6 +43,17 @@ export default function Lines() {
         throw new Error('Failed to fetch lines');
       }
       return response.json();
+    },
+    initialData: () => readCachedLines(filters)?.lines,
+    onSuccess: (data) => {
+      const cachePayload = {
+        lines: data,
+        lastFetched: new Date().toISOString(),
+        filters,
+      };
+
+      persistCachedLines(cachePayload);
+      queryClient.setQueryData(LAST_LINES_QUERY_KEY, cachePayload);
     },
   });
 
