@@ -203,6 +203,8 @@ export const hedgeSuggestions = pgTable("hedge_suggestions", {
 });
 
 // Cost Records
+export const costCategories = ["api", "compute", "storage", "misc"] as const;
+
 export const costRecords = pgTable("cost_records", {
   id: varchar("id").primaryKey().default(sql`gen_random_uuid()`),
   category: varchar("category").notNull(), // api, compute, storage, misc
@@ -369,9 +371,13 @@ export const insertHedgeSuggestionSchema = createInsertSchema(hedgeSuggestions).
   createdAt: true,
 });
 
-export const insertCostRecordSchema = createInsertSchema(costRecords).omit({
+const baseInsertCostRecordSchema = createInsertSchema(costRecords).omit({
   id: true,
   timestamp: true,
+});
+
+export const insertCostRecordSchema = baseInsertCostRecordSchema.extend({
+  category: z.enum(costCategories).default("api"),
 });
 
 export const insertPnlRecordSchema = createInsertSchema(pnlRecords).omit({
