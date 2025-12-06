@@ -9,10 +9,15 @@ import ArbitrageCard from "@/components/ArbitrageCard";
 import HedgeAlert from "@/components/HedgeAlert";
 import JobStatus from "@/components/JobStatus";
 import { useToast } from "@/hooks/use-toast";
-import { 
-  TrendingUp, 
-  Shield, 
-  BarChart3, 
+import {
+  LAST_ARBITRAGE_SCAN_QUERY_KEY,
+  type CachedArbitrageScan,
+  readCachedScan,
+} from "@/lib/arbitrageCache";
+import {
+  TrendingUp,
+  Shield,
+  BarChart3,
   DollarSign,
   RefreshCw,
   Filter,
@@ -28,37 +33,7 @@ import type {
 } from "@/types";
 
 // --- Arbitrage scan types from POST /api/scan/arbs ---
-
-type ArbLeg = {
-  outcome: string;
-  sportsbook: string;
-  odds: string; // American odds, e.g. "+100"
-  stake: number;
-};
-
-type ArbEvent = {
-  id: string;
-  homeTeam: string;
-  awayTeam: string;
-  sport: string;
-  league: string;
-  startTime: string; // formatted string from API, e.g. "12/7/2025, 1:00:00 PM"
-};
-
-type ArbMarket = {
-  type: string;        // "SPREADS" | "H2H" | "TOTALS"
-  description: string; // "Moneyline", "Point Spread", "Over/Under"
-};
-
-type ArbitrageOpportunity = {
-  event: ArbEvent;
-  market: ArbMarket;
-  legs: ArbLeg[];
-  profitPct: number;
-  validityWindow: number;
-  confidenceScore: number;
-  lockedProfit: number;
-};
+type ArbitrageOpportunity = ArbitrageOpportunityDisplay & { lockedProfit?: number };
 
 type ArbsScanResponse = {
   success: boolean;
@@ -191,6 +166,11 @@ export default function Dashboard() {
       queryKey: ["/api/arbitrage/opportunities"],
     });
 
+  const { data: lastArbScanCache } = useQuery<CachedArbitrageScan | null>({
+    queryKey: LAST_ARBITRAGE_SCAN_QUERY_KEY,
+    queryFn: () => readCachedScan(),
+  });
+
   const { data: hedgeResponse, isLoading: hedgeLoading } =
     useQuery<HedgeCandidatesResponse>({
       queryKey: ["/api/hedge/candidates"],
@@ -259,10 +239,15 @@ export default function Dashboard() {
     }
   };
 
-  // Prefer the most recent scan on this page; otherwise fall back to shared active opps
+  const cachedScanOpportunities =
+    lastArbScanCache?.scanResults?.rankedOpportunities ?? [];
+
+  // Prefer the most recent scan on this page; otherwise fall back to cached scan results, then shared active opps
   const baseOpportunities: ArbitrageOpportunity[] =
     scanResult?.rankedOpportunities?.length
       ? scanResult.rankedOpportunities
+      : cachedScanOpportunities.length
+      ? cachedScanOpportunities
       : activeOpportunities;
 
   const profitableOpportunities: ArbitrageOpportunity[] =
@@ -280,10 +265,11 @@ export default function Dashboard() {
     }));
   }, [hedgeResponse]);
 
-  const lastScanTimeLabel =
-    scanResult?.timestamp
-      ? new Date(scanResult.timestamp).toLocaleTimeString()
-      : null;
+  const lastScanTimeLabel = scanResult?.timestamp
+    ? new Date(scanResult.timestamp).toLocaleTimeString()
+    : lastArbScanCache?.lastScanTime
+    ? new Date(lastArbScanCache.lastScanTime).toLocaleTimeString()
+    : null;
 
   const { data: jobs = [], isLoading: jobsLoading } = useQuery<JobStatusDisplay[]>({
     queryKey: ["/api/jobs"],
