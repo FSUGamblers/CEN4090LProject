@@ -3,6 +3,13 @@ import express, { type Request, Response, NextFunction } from "express";
 import { registerRoutes } from "./routes";
 import { setupVite, serveStatic, log } from "./vite";
 
+// Default NODE_ENV based on the npm script invoked so Windows shells
+// (which don't support inline environment assignment) still run correctly.
+if (!process.env.NODE_ENV) {
+  process.env.NODE_ENV =
+    process.env.npm_lifecycle_event === "start" ? "production" : "development";
+}
+
 const app = express();
 app.use(express.json());
 app.use(express.urlencoded({ extended: false }));
