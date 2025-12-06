@@ -10,7 +10,9 @@ EXCEPTION
 END $$;
 
 -- Drop dependent foreign keys before reshaping the user_bets primary key
+ALTER TABLE IF EXISTS hedge_suggestions DROP CONSTRAINT IF EXISTS hedge_suggestions_user_bet_id_user_bets_id_fk;
 ALTER TABLE IF EXISTS hedge_suggestions DROP CONSTRAINT IF EXISTS hedge_suggestions_user_bet_id_fkey;
+ALTER TABLE IF EXISTS pnl_records DROP CONSTRAINT IF EXISTS pnl_records_user_bet_id_user_bets_id_fk;
 ALTER TABLE IF EXISTS pnl_records DROP CONSTRAINT IF EXISTS pnl_records_user_bet_id_fkey;
 
 -- Prepare a new UUID-based identifier on user_bets
