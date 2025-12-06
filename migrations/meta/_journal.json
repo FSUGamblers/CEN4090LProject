@@ -1,0 +1,13 @@
+{
+  "version": "7",
+  "dialect": "postgresql",
+  "entries": [
+    {
+      "idx": 0,
+      "version": "7",
+      "when": 1764985970629,
+      "tag": "0000_add_missing_user_bets_columns",
+      "breakpoints": true
+    }
+  ]
+}
