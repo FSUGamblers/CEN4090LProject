@@ -300,6 +300,8 @@ export default function Dashboard() {
       })),
   });
 
+  const safeJobs = Array.isArray(jobs) ? jobs : [];
+
   // This is now the "board" we use for empty / non-empty messaging
   const displayedOpportunities = baseOpportunities;
 
@@ -587,8 +589,8 @@ export default function Dashboard() {
                     </div>
                   ))}
                 </div>
-              ) : jobs.length > 0 ? (
-                jobs.map((job, index) => (
+              ) : safeJobs.length > 0 ? (
+                safeJobs.map((job, index) => (
                   <JobStatus
                     key={`${job.name}-${index}`}
                     job={job}
