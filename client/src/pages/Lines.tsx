@@ -17,6 +17,7 @@ export default function Lines() {
   const { toast } = useToast();
   const queryClient = useQueryClient();
   const [filters, setFilters] = useState<LinesFilters>({});
+  const [hasShownError, setHasShownError] = useState(false);
 
   useEffect(() => {
     const cached = readCachedLines(filters);
@@ -55,7 +56,26 @@ export default function Lines() {
       persistCachedLines(cachePayload);
       queryClient.setQueryData(LAST_LINES_QUERY_KEY, cachePayload);
     },
+    refetchOnReconnect: false,
+    refetchOnWindowFocus: false,
   });
+
+  useEffect(() => {
+    if (!error || hasShownError) return;
+
+    toast({
+      title: "Error Loading Lines",
+      description: "Failed to load lines data. Please try again.",
+      variant: "destructive",
+    });
+    setHasShownError(true);
+  }, [error, hasShownError, toast]);
+
+  useEffect(() => {
+    if (!error && hasShownError) {
+      setHasShownError(false);
+    }
+  }, [error, hasShownError]);
 
   // Get unique values for filters
   const sports = Array.from(new Set(lines?.map(line => line.market.event.sport.code) || []));
@@ -110,14 +130,6 @@ export default function Lines() {
     }
     return `Event ${event.id}`;
   };
-
-  if (error) {
-    toast({
-      title: "Error Loading Lines",
-      description: "Failed to load lines data. Please try again.",
-      variant: "destructive",
-    });
-  }
 
   return (
     <div className="space-y-8">
