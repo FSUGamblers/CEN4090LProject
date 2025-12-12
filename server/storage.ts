@@ -211,6 +211,21 @@ export interface IStorage {
 }
 
 export class DatabaseStorage implements IStorage {
+  constructor() {
+    // Ensure legacy databases allow nullable event IDs for manual bets
+    // This aligns runtime schema with the latest migrations even if they haven't been applied.
+    void this.ensureUserBetEventIdNullable();
+  }
+
+  private async ensureUserBetEventIdNullable() {
+    try {
+      await db.execute(sql`ALTER TABLE "user_bets" ALTER COLUMN "event_id" DROP NOT NULL`);
+    } catch (error) {
+      // If the constraint has already been dropped or the query fails, log at debug level and continue.
+      console.debug("Schema check: user_bets.event_id already nullable or alter failed", error);
+    }
+  }
+
   // User operations
   async getUser(id: string): Promise<User | undefined> {
     const [user] = await db.select().from(users).where(eq(users.id, id));
