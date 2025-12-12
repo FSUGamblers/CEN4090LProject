@@ -2,7 +2,7 @@ import { storage } from "../storage";
 import { auditService } from "./auditService";
 import { oddsService } from "./oddsService";
 import { arbitrageService } from "./arbitrageService";
-import { hedgeService } from "./hedgeService";
+import { computeHedgeCandidates } from "./hedgeService";
 import type { JobRun } from "@shared/schema";
 
 interface Job {
@@ -113,16 +113,15 @@ class JobScheduler {
       await auditService.log("system", "hedge_monitoring_started", "job", job.id, {});
 
       // Get all tracked bets and check for hedge opportunities
-      const trackedBets = await storage.getUserBets("", { status: "pending" });
-      const activeBets = trackedBets.filter(bet => bet.isTracked);
+      const activeBets = await storage.getUserBets("", { status: "open" });
 
       let hedgesCalculated = 0;
       for (const bet of activeBets) {
         try {
-          await hedgeService.calculateHedgeSuggestion(bet.id);
+          await computeHedgeCandidates(bet.userId, [bet]);
           hedgesCalculated++;
         } catch (error) {
-          console.error(`Error calculating hedge for bet ${bet.id}:`, error);
+          console.error(`Error computing hedge candidates for bet ${bet.id}:`, error);
         }
       }
 

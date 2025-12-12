@@ -1,7 +1,17 @@
 import 'dotenv/config';
 import express, { type Request, Response, NextFunction } from "express";
+import path from "path";
 import { registerRoutes } from "./routes";
 import { setupVite, serveStatic, log } from "./vite";
+import { migrate } from "drizzle-orm/node-postgres/migrator";
+import { db } from "./db";
+
+// Default NODE_ENV based on the npm script invoked so Windows shells
+// (which don't support inline environment assignment) still run correctly.
+if (!process.env.NODE_ENV) {
+  process.env.NODE_ENV =
+    process.env.npm_lifecycle_event === "start" ? "production" : "development";
+}
 
 const app = express();
 app.use(express.json());
@@ -26,10 +36,6 @@ app.use((req, res, next) => {
         logLine += ` :: ${JSON.stringify(capturedJsonResponse)}`;
       }
 
-      if (logLine.length > 80) {
-        logLine = logLine.slice(0, 79) + "…";
-      }
-
       log(logLine);
     }
   });
@@ -38,6 +44,17 @@ app.use((req, res, next) => {
 });
 
 (async () => {
+  try {
+    if (db) {
+      await migrate(db, { migrationsFolder: path.resolve(process.cwd(), "migrations") });
+    } else {
+      console.warn("DATABASE_URL missing; starting in in-memory storage mode. Migrations skipped.");
+    }
+  } catch (error) {
+    console.error("Failed to run database migrations:", error);
+    process.exit(1);
+  }
+
   const server = await registerRoutes(app);
 
   app.use((err: any, _req: Request, res: Response, _next: NextFunction) => {
@@ -45,7 +62,15 @@ app.use((req, res, next) => {
     const message = err.message || "Internal Server Error";
 
     res.status(status).json({ message });
-    throw err;
+    log(
+      JSON.stringify({
+        level: "error",
+        status,
+        message,
+        stack: err?.stack,
+      }),
+      "express",
+    );
   });
 
   // importantly only setup vite in development and after
@@ -65,7 +90,6 @@ app.use((req, res, next) => {
   server.listen({
     port,
     host: "0.0.0.0",
-    reusePort: true,
   }, () => {
     log(`serving on port ${port}`);
   });

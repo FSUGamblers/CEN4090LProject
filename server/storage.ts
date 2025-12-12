@@ -16,6 +16,7 @@ import {
   jobRuns,
   featureFlags,
   auditLogs,
+  insertCostRecordSchema,
   type User,
   type UpsertUser,
   type Sport,
@@ -53,6 +54,7 @@ import {
 } from "@shared/schema";
 import { db } from "./db";
 import { eq, desc, and, gte, lte, sql } from "drizzle-orm";
+import { randomUUID } from "crypto";
 
 export interface IStorage {
   // User operations (required for App Auth)
@@ -109,6 +111,7 @@ export interface IStorage {
     live?: boolean;
     stateCode?: string;
     sportId?: string;
+    activeOnly?: boolean;
   }): Promise<ArbitrageOpportunity[]>;
   createArbitrageOpportunity(opportunity: InsertArbitrageOpportunity): Promise<ArbitrageOpportunity>;
   deleteExpiredArbitrageOpportunities(): Promise<void>;
@@ -177,6 +180,15 @@ export interface IStorage {
     awayTeam?: Team;
   }>>;
 
+  getEventWithDetails(eventId: string): Promise<
+    (Event & {
+      sport: Sport;
+      league: League;
+      homeTeam?: Team;
+      awayTeam?: Team;
+    }) | undefined
+  >;
+
   // Get quotes with full context for arbitrage calculations
   getQuotesWithContext(filters?: {
     eventId?: string;
@@ -200,6 +212,21 @@ export interface IStorage {
 }
 
 export class DatabaseStorage implements IStorage {
+  constructor() {
+    // Ensure legacy databases allow nullable event IDs for manual bets
+    // This aligns runtime schema with the latest migrations even if they haven't been applied.
+    void this.ensureUserBetEventIdNullable();
+  }
+
+  private async ensureUserBetEventIdNullable() {
+    try {
+      await db.execute(sql`ALTER TABLE "user_bets" ALTER COLUMN "event_id" DROP NOT NULL`);
+    } catch (error) {
+      // If the constraint has already been dropped or the query fails, log at debug level and continue.
+      console.debug("Schema check: user_bets.event_id already nullable or alter failed", error);
+    }
+  }
+
   // User operations
   async getUser(id: string): Promise<User | undefined> {
     const [user] = await db.select().from(users).where(eq(users.id, id));
@@ -379,20 +406,26 @@ export class DatabaseStorage implements IStorage {
     live?: boolean;
     stateCode?: string;
     sportId?: string;
+    activeOnly?: boolean;
   }): Promise<ArbitrageOpportunity[]> {
     let query = db.select().from(arbitrageOpportunities);
-    
-    if (filters) {
-      const conditions = [];
-      if (filters.minProfit) {
-        conditions.push(gte(arbitrageOpportunities.expectedProfitPct, filters.minProfit.toString()));
-      }
-      
-      if (conditions.length > 0) {
-        query = query.where(and(...conditions));
-      }
+
+    const conditions = [] as any[];
+
+    if (filters?.minProfit) {
+      conditions.push(
+        gte(arbitrageOpportunities.expectedProfitPct, filters.minProfit.toString())
+      );
     }
-    
+
+    if (filters?.activeOnly) {
+      conditions.push(gte(arbitrageOpportunities.expiresAt, new Date()));
+    }
+
+    if (conditions.length > 0) {
+      query = query.where(and(...conditions));
+    }
+
     return await query.orderBy(desc(arbitrageOpportunities.expectedProfitPct));
   }
 
@@ -410,11 +443,11 @@ export class DatabaseStorage implements IStorage {
   // User bet operations
   async getUserBets(userId: string, filters?: { status?: string; sportId?: string }): Promise<UserBet[]> {
     let query = db.select().from(userBets).where(eq(userBets.userId, userId));
-    
+
     if (filters?.status) {
-      query = query.where(and(eq(userBets.userId, userId), eq(userBets.settlement, filters.status)));
+      query = query.where(and(eq(userBets.userId, userId), eq(userBets.status, filters.status)));
     }
-    
+
     return await query.orderBy(desc(userBets.createdAt));
   }
 
@@ -431,7 +464,7 @@ export class DatabaseStorage implements IStorage {
   async updateUserBet(id: string, updates: Partial<UserBet>): Promise<UserBet> {
     const [updated] = await db
       .update(userBets)
-      .set(updates)
+      .set({ ...updates, updatedAt: new Date() })
       .where(eq(userBets.id, id))
       .returning();
     return updated;
@@ -453,7 +486,12 @@ export class DatabaseStorage implements IStorage {
 
   // Cost and PnL operations
   async createCostRecord(cost: InsertCostRecord): Promise<CostRecord> {
-    const [created] = await db.insert(costRecords).values(cost).returning();
+    const parsed = insertCostRecordSchema.parse({
+      ...cost,
+      category: cost.category ?? "api",
+    });
+
+    const [created] = await db.insert(costRecords).values(parsed).returning();
     return created;
   }
 
@@ -840,4 +878,435 @@ export class DatabaseStorage implements IStorage {
   }
 }
 
-export const storage = new DatabaseStorage();
+class InMemoryStorage implements IStorage {
+  private users = new Map<string, User>();
+  private sports: any[] = [];
+  private leagues: any[] = [];
+  private teams: any[] = [];
+  private sportsbooks: any[] = [];
+  private computeLocations: any[] = [];
+  private events: any[] = [];
+  private markets: any[] = [];
+  private quotes: any[] = [];
+  private arbitrageOpportunities: any[] = [];
+  private userBetsStore: any[] = [];
+  private hedgeSuggestionsStore: any[] = [];
+  private costRecordsStore: any[] = [];
+  private pnlRecordsStore: any[] = [];
+  private jobRunsStore: any[] = [];
+  private featureFlagsStore: any[] = [];
+  private auditLogsStore: any[] = [];
+
+  private ensureId<T>(payload: T): T & { id: string } {
+    return { ...payload, id: (payload as any).id ?? randomUUID() } as T & { id: string };
+  }
+
+  private toTime(value: any): number {
+    return value ? new Date(value as any).getTime() : 0;
+  }
+
+  async getUser(id: string): Promise<User | undefined> {
+    return this.users.get(id);
+  }
+
+  async upsertUser(userData: UpsertUser): Promise<User> {
+    const existing = this.users.get(userData.id);
+    const user: User = {
+      id: userData.id,
+      email: userData.email,
+      firstName: userData.firstName,
+      lastName: userData.lastName,
+      profileImageUrl: userData.profileImageUrl,
+      role: existing?.role ?? "member",
+      status: existing?.status ?? "active",
+      notificationPrefs: existing?.notificationPrefs ?? { inApp: true, email: true, webhook: false },
+      createdAt: existing?.createdAt ?? new Date(),
+      updatedAt: new Date(),
+    };
+
+    this.users.set(user.id, user);
+    return user;
+  }
+
+  async getSports(): Promise<Sport[]> {
+    return [...this.sports];
+  }
+
+  async createSport(sport: InsertSport): Promise<Sport> {
+    const created = this.ensureId({ ...sport, createdAt: new Date() }) as Sport;
+    this.sports.push(created);
+    return created;
+  }
+
+  async getSportByCode(code: string): Promise<Sport | undefined> {
+    return this.sports.find((sport) => sport.code === code);
+  }
+
+  async getLeagues(sportId?: string): Promise<League[]> {
+    return this.leagues.filter((league) => !sportId || league.sportId === sportId);
+  }
+
+  async createLeague(league: InsertLeague): Promise<League> {
+    const created = this.ensureId({ ...league, createdAt: new Date() }) as League;
+    this.leagues.push(created);
+    return created;
+  }
+
+  async getTeams(leagueId?: string): Promise<Team[]> {
+    return this.teams.filter((team) => !leagueId || team.leagueId === leagueId);
+  }
+
+  async createTeam(team: InsertTeam): Promise<Team> {
+    const created = this.ensureId({ ...team, createdAt: new Date() }) as Team;
+    this.teams.push(created);
+    return created;
+  }
+
+  async getSportsbooks(): Promise<Sportsbook[]> {
+    return [...this.sportsbooks];
+  }
+
+  async createSportsbook(sportsbook: InsertSportsbook): Promise<Sportsbook> {
+    const created = this.ensureId({
+      ...sportsbook,
+      supportedStates: sportsbook.supportedStates ?? [],
+      createdAt: new Date(),
+    }) as Sportsbook;
+    this.sportsbooks.push(created);
+    return created;
+  }
+
+  async getSportsbooksByState(stateCode: string): Promise<Sportsbook[]> {
+    return this.sportsbooks.filter((book) => book.supportedStates?.includes(stateCode));
+  }
+
+  async getComputeLocations(): Promise<ComputeLocation[]> {
+    return [...this.computeLocations];
+  }
+
+  async createComputeLocation(location: InsertComputeLocation): Promise<ComputeLocation> {
+    const created = this.ensureId({
+      ...location,
+      status: location.status ?? "active",
+      createdAt: new Date(),
+    }) as ComputeLocation;
+    this.computeLocations.push(created);
+    return created;
+  }
+
+  async getActiveComputeLocations(): Promise<ComputeLocation[]> {
+    return this.computeLocations.filter((loc) => loc.status === "active");
+  }
+
+  async getEvents(filters?: { leagueId?: string; status?: string; from?: Date; to?: Date; sportId?: string }): Promise<Event[]> {
+    return this.events.filter((event) => {
+      const matchesLeague = !filters?.leagueId || event.leagueId === filters.leagueId;
+      const matchesStatus = !filters?.status || event.status === filters.status;
+      const league = this.leagues.find((l) => l.id === event.leagueId);
+      const matchesSport = !filters?.sportId || league?.sportId === filters.sportId;
+      const matchesFrom = !filters?.from || event.startTime >= filters.from;
+      const matchesTo = !filters?.to || event.startTime <= filters.to;
+      return matchesLeague && matchesStatus && matchesSport && matchesFrom && matchesTo;
+    });
+  }
+
+  async getEvent(id: string): Promise<Event | undefined> {
+    return this.events.find((event) => event.id === id);
+  }
+
+  async getEventWithDetails(eventId: string): Promise<(Event & { sport: Sport; league: League; homeTeam?: Team; awayTeam?: Team }) | undefined> {
+    const event = await this.getEvent(eventId);
+    if (!event) return undefined;
+    const league = this.leagues.find((l) => l.id === event.leagueId)!;
+    const sport = this.sports.find((s) => s.id === league?.sportId)!;
+    const homeTeam = event.homeTeamId ? this.teams.find((t) => t.id === event.homeTeamId) : undefined;
+    const awayTeam = event.awayTeamId ? this.teams.find((t) => t.id === event.awayTeamId) : undefined;
+    return { ...event, sport, league, homeTeam, awayTeam };
+  }
+
+  async createEvent(event: InsertEvent): Promise<Event> {
+    const created = this.ensureId({
+      ...event,
+      status: (event as any).status ?? event.status ?? "scheduled",
+      createdAt: new Date(),
+    }) as Event;
+    this.events.push(created);
+    return created;
+  }
+
+  async getMarkets(eventId: string): Promise<Market[]> {
+    return this.markets.filter((market) => market.eventId === eventId);
+  }
+
+  async createMarket(market: InsertMarket): Promise<Market> {
+    const created = this.ensureId({ ...market, createdAt: new Date() }) as Market;
+    this.markets.push(created);
+    return created;
+  }
+
+  async getQuotes(marketId: string, _live?: boolean): Promise<Quote[]> {
+    return this.quotes.filter((quote) => quote.marketId === marketId);
+  }
+
+  async createQuote(quote: InsertQuote): Promise<Quote> {
+    const created = this.ensureId({ ...quote, timestamp: new Date() }) as Quote;
+    this.quotes.push(created);
+    return created;
+  }
+
+  async createQuotes(quotes: InsertQuote[]): Promise<Quote[]> {
+    const created = quotes.map((quote) => this.ensureId({ ...quote, timestamp: new Date() }) as Quote);
+    this.quotes.push(...created);
+    return created;
+  }
+
+  async getArbitrageOpportunities(filters?: { leagueId?: string; minProfit?: number; live?: boolean; stateCode?: string; sportId?: string; activeOnly?: boolean }): Promise<ArbitrageOpportunity[]> {
+    return this.arbitrageOpportunities.filter((raw) => {
+      const opp = raw as any;
+      const matchesLeague = !filters?.leagueId || opp.leagueId === filters.leagueId;
+      const matchesSport = !filters?.sportId || opp.sportId === filters.sportId;
+      const matchesProfit = typeof filters?.minProfit === "undefined" || Number(opp.expectedProfitPct ?? opp.profitPct ?? 0) >= (filters?.minProfit || 0);
+      const matchesLive = typeof filters?.live === "undefined" || opp.live === filters.live;
+      const matchesActive = !filters?.activeOnly || !opp.expiresAt || new Date(opp.expiresAt).getTime() > Date.now();
+      return matchesLeague && matchesSport && matchesProfit && matchesLive && matchesActive;
+    }) as ArbitrageOpportunity[];
+  }
+
+  async createArbitrageOpportunity(opportunity: InsertArbitrageOpportunity): Promise<ArbitrageOpportunity> {
+    const created = this.ensureId({
+      ...opportunity,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    }) as ArbitrageOpportunity;
+    this.arbitrageOpportunities.push(created);
+    return created;
+  }
+
+  async deleteExpiredArbitrageOpportunities(): Promise<void> {
+    const now = Date.now();
+    this.arbitrageOpportunities = this.arbitrageOpportunities.filter((opp) => !opp.expiresAt || opp.expiresAt.getTime() > now);
+  }
+
+  async getUserBets(userId: string, filters?: { status?: string; sportId?: string }): Promise<UserBet[]> {
+    return this.userBetsStore
+      .filter((bet) => bet.userId === userId)
+      .filter((bet) => !filters?.status || bet.status === filters.status)
+      .sort((a, b) => this.toTime(b.createdAt) - this.toTime(a.createdAt));
+  }
+
+  async getUserBet(id: string): Promise<UserBet | undefined> {
+    return this.userBetsStore.find((bet) => bet.id === id);
+  }
+
+  async createUserBet(bet: InsertUserBet): Promise<UserBet> {
+    const created = this.ensureId({
+      ...bet,
+      status: bet.status ?? "open",
+      stake: bet.stake ?? "0",
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    }) as UserBet;
+    this.userBetsStore.push(created);
+    return created;
+  }
+
+  async updateUserBet(id: string, updates: Partial<UserBet>): Promise<UserBet> {
+    const existing = await this.getUserBet(id);
+    if (!existing) throw new Error("Bet not found");
+    const updated: UserBet = { ...existing, ...updates, updatedAt: new Date() };
+    this.userBetsStore = this.userBetsStore.map((bet) => (bet.id === id ? updated : bet));
+    return updated;
+  }
+
+  async getHedgeSuggestions(userBetId: string): Promise<HedgeSuggestion[]> {
+    return this.hedgeSuggestionsStore
+      .filter((suggestion) => suggestion.userBetId === userBetId)
+      .sort((a, b) => this.toTime(b.createdAt) - this.toTime(a.createdAt));
+  }
+
+  async createHedgeSuggestion(suggestion: InsertHedgeSuggestion): Promise<HedgeSuggestion> {
+    const created = this.ensureId({ ...suggestion, createdAt: new Date() }) as HedgeSuggestion;
+    this.hedgeSuggestionsStore.push(created);
+    return created;
+  }
+
+  async createCostRecord(cost: InsertCostRecord): Promise<CostRecord> {
+    const parsed = insertCostRecordSchema.parse({ ...cost, category: cost.category ?? "api" });
+    const created = this.ensureId({ ...parsed, timestamp: new Date() }) as CostRecord;
+    this.costRecordsStore.push(created);
+    return created;
+  }
+
+  async createPnlRecord(pnl: InsertPnlRecord): Promise<PnlRecord> {
+    const created = this.ensureId({ ...pnl, timestamp: new Date() }) as PnlRecord;
+    this.pnlRecordsStore.push(created);
+    return created;
+  }
+
+  async getPnlSummary(from?: Date, to?: Date, _bucket?: string): Promise<any> {
+    const records = this.pnlRecordsStore.filter((record) => {
+      if (from && this.toTime(record.timestamp) < from.getTime()) return false;
+      if (to && this.toTime(record.timestamp) > to.getTime()) return false;
+      return true;
+    });
+
+    return records.reduce((acc, record) => {
+      acc[record.type] = (acc[record.type] || 0) + Number(record.amount);
+      return acc;
+    }, {} as Record<string, number>);
+  }
+
+  async getJobRuns(): Promise<JobRun[]> {
+    return [...this.jobRunsStore].sort((a, b) => this.toTime(b.startedAt) - this.toTime(a.startedAt));
+  }
+
+  async createJobRun(job: InsertJobRun): Promise<JobRun> {
+    const created = this.ensureId({
+      ...job,
+      status: job.status ?? "running",
+      startedAt: job.startedAt ?? new Date(),
+    }) as JobRun;
+    this.jobRunsStore.push(created);
+    return created;
+  }
+
+  async updateJobRun(id: string, updates: Partial<JobRun>): Promise<JobRun> {
+    const existing = this.jobRunsStore.find((job) => job.id === id);
+    if (!existing) throw new Error("Job run not found");
+    const updated: JobRun = { ...existing, ...updates };
+    this.jobRunsStore = this.jobRunsStore.map((job) => (job.id === id ? updated : job));
+    return updated;
+  }
+
+  async getFeatureFlags(): Promise<FeatureFlag[]> {
+    return [...this.featureFlagsStore];
+  }
+
+  async getFeatureFlag(key: string): Promise<FeatureFlag | undefined> {
+    return this.featureFlagsStore.find((flag) => flag.key === key);
+  }
+
+  async upsertFeatureFlag(flag: InsertFeatureFlag): Promise<FeatureFlag> {
+    const existing = await this.getFeatureFlag(flag.key);
+    if (existing) {
+      const updated: FeatureFlag = { ...existing, ...flag, updatedAt: new Date() };
+      this.featureFlagsStore = this.featureFlagsStore.map((f) => (f.key === flag.key ? updated : f));
+      return updated;
+    }
+    const created: FeatureFlag = { ...flag, createdAt: new Date(), updatedAt: new Date() } as FeatureFlag;
+    this.featureFlagsStore.push(created);
+    return created;
+  }
+
+  async createAuditLog(log: InsertAuditLog): Promise<AuditLog> {
+    const created = this.ensureId({ ...log, timestamp: new Date() }) as AuditLog;
+    this.auditLogsStore.push(created);
+    return created;
+  }
+
+  async getAuditLogs(filters?: { since?: Date; actor?: string }): Promise<AuditLog[]> {
+    return this.auditLogsStore.filter((log) => {
+      const matchesSince = !filters?.since || (log.timestamp && this.toTime(log.timestamp) >= filters.since.getTime());
+      const matchesActor = !filters?.actor || log.actor === filters.actor;
+      return matchesSince && matchesActor;
+    });
+  }
+
+  async getComprehensiveOddsData(filters?: { sportId?: string; stateCode?: string; since?: Date; eventStatus?: string; limit?: number }): Promise<Array<{ event: Event & { sport: Sport; league: League; homeTeam?: Team; awayTeam?: Team }; markets: Array<{ market: Market; quotes: Array<Quote & { sportsbook: Sportsbook }> }> }>> {
+    const events = await this.getEventsWithDetails({ sportId: filters?.sportId, status: filters?.eventStatus });
+    const results: Array<{ event: Event & { sport: Sport; league: League; homeTeam?: Team; awayTeam?: Team }; markets: Array<{ market: Market; quotes: Array<Quote & { sportsbook: Sportsbook }> }> }> = [];
+
+    for (const event of events) {
+      const eventMarkets = this.markets.filter((market) => market.eventId === event.id);
+      const marketEntries = eventMarkets.map((market) => {
+        const quotes = this.quotes
+          .filter((quote) => quote.marketId === market.id)
+          .filter((quote) => !filters?.since || this.toTime(quote.timestamp) >= filters.since.getTime())
+          .filter((quote) => {
+            if (!filters?.stateCode) return true;
+            const book = this.sportsbooks.find((b) => b.id === quote.sportsbookId);
+            return book?.supportedStates?.includes(filters.stateCode);
+          })
+          .map((quote) => ({ ...quote, sportsbook: this.sportsbooks.find((b) => b.id === quote.sportsbookId)! }));
+
+        return { market, quotes };
+      });
+
+      results.push({ event, markets: marketEntries });
+    }
+
+    return results.slice(0, filters?.limit || results.length);
+  }
+
+  async getEventsWithDetails(filters?: { sportId?: string; leagueId?: string; status?: string; from?: Date; to?: Date; limit?: number }): Promise<Array<Event & { sport: Sport; league: League; homeTeam?: Team; awayTeam?: Team }>> {
+    const events = await this.getEvents({
+      sportId: filters?.sportId,
+      leagueId: filters?.leagueId,
+      status: filters?.status,
+      from: filters?.from,
+      to: filters?.to,
+    });
+
+    const detailed = events.map((event) => {
+      const league = this.leagues.find((l) => l.id === event.leagueId)!;
+      const sport = this.sports.find((s) => s.id === league?.sportId)!;
+      const homeTeam = event.homeTeamId ? this.teams.find((t) => t.id === event.homeTeamId) : undefined;
+      const awayTeam = event.awayTeamId ? this.teams.find((t) => t.id === event.awayTeamId) : undefined;
+      return { ...event, sport, league, homeTeam, awayTeam };
+    });
+
+    return filters?.limit ? detailed.slice(0, filters.limit) : detailed;
+  }
+
+  async getQuotesWithContext(filters?: { eventId?: string; marketType?: string; live?: boolean; stateCode?: string }): Promise<Array<Quote & { sportsbook: Sportsbook; market: Market & { event: Event & { sport: Sport; league: League; homeTeam?: Team; awayTeam?: Team } } }>> {
+    const filteredQuotes = this.quotes.filter((quote) => {
+      const market = this.markets.find((m) => m.id === quote.marketId);
+      if (!market) return false;
+      const event = this.events.find((e) => e.id === market.eventId);
+      if (!event) return false;
+      if (filters?.eventId && event.id !== filters.eventId) return false;
+      if (filters?.marketType && market.marketType !== filters.marketType) return false;
+      if (typeof filters?.live !== "undefined") {
+        const isLive = event.status === "live";
+        if (isLive !== filters.live) return false;
+      }
+      if (filters?.stateCode) {
+        const book = this.sportsbooks.find((b) => b.id === quote.sportsbookId);
+        if (!book?.supportedStates?.includes(filters.stateCode)) return false;
+      }
+      return true;
+    });
+
+    const eventCache = new Map<string, Event & { sport: Sport; league: League; homeTeam?: Team; awayTeam?: Team }>();
+    const enrichedQuotes: Array<Quote & { sportsbook: Sportsbook; market: Market & { event: Event & { sport: Sport; league: League; homeTeam?: Team; awayTeam?: Team } } }> = [];
+
+    for (const quote of filteredQuotes) {
+      const sportsbook = this.sportsbooks.find((book) => book.id === quote.sportsbookId);
+      const market = this.markets.find((m) => m.id === quote.marketId);
+      if (!market || !sportsbook) continue;
+
+      let eventDetail = eventCache.get(market.eventId);
+      if (!eventDetail) {
+        const event = await this.getEventWithDetails(market.eventId);
+        if (event) {
+          eventCache.set(market.eventId, event);
+          eventDetail = event;
+        }
+      }
+
+      if (eventDetail) {
+        enrichedQuotes.push({ ...quote, sportsbook, market: { ...market, event: eventDetail } });
+      }
+    }
+
+    return enrichedQuotes;
+  }
+
+  async findOrCreateTeam(name: string, leagueId: string, shortName?: string): Promise<Team> {
+    const existing = this.teams.find((team) => team.name === name || team.shortName === shortName);
+    if (existing) return existing;
+    return this.createTeam({ leagueId, name, shortName: shortName || name.substring(0, 3).toUpperCase() });
+  }
+}
+
+export const storage: IStorage = db ? new DatabaseStorage() : new InMemoryStorage();

@@ -1,411 +1,443 @@
 import { useState } from "react";
-import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { Shield, Plus, Edit3, Save, XCircle } from "lucide-react";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
-import { Badge } from "@/components/ui/badge";
 import { Textarea } from "@/components/ui/textarea";
-import { Separator } from "@/components/ui/separator";
-import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogTrigger } from "@/components/ui/dialog";
-import { useToast } from "@/hooks/use-toast";
+import { Badge } from "@/components/ui/badge";
 import { apiRequest } from "@/lib/queryClient";
-import { Shield, Plus, TrendingUp, AlertTriangle, Eye, EyeOff } from "lucide-react";
+import { useToast } from "@/hooks/use-toast";
 
-interface UserBet {
+type ManualBet = {
   id: string;
-  eventId: string;
-  marketId: string;
-  sportsbookId: string;
-  outcomeId: string;
+  sport: string;
+  league?: string | null;
+  homeTeam?: string | null;
+  awayTeam?: string | null;
+  marketType: string;
+  selection: string;
+  sportsbook: string;
+  oddsAmerican: number;
   stake: string;
-  priceAtBet: string;
-  notes?: string;
-  isTracked: boolean;
-  settlement: string;
+  status: string;
+  notes?: string | null;
   createdAt: string;
-}
+};
 
-interface HedgeSuggestion {
-  id: string;
-  suggestedLegs: Array<{
-    sportsbookId: string;
-    outcomeId: string;
-    priceValue: number;
-    stake: number;
-  }>;
-  lockedProfitLow: string;
-  lockedProfitHigh: string;
-  rationale: string;
-  confidence: string;
-  expiresAt: string;
-}
+const statusOptions = ["open", "won", "lost", "void", "settled"];
+
+const initialBetForm = {
+  sport: "",
+  league: "",
+  homeTeam: "",
+  awayTeam: "",
+  marketType: "Moneyline",
+  selection: "",
+  sportsbook: "",
+  oddsAmerican: "",
+  stake: "",
+  status: "open",
+  notes: "",
+};
 
 export default function HedgeCenter() {
   const { toast } = useToast();
   const queryClient = useQueryClient();
-  const [showAddBet, setShowAddBet] = useState(false);
-  const [newBet, setNewBet] = useState({
-    eventId: "",
-    marketId: "", 
-    sportsbookId: "",
-    outcomeId: "",
-    stake: "",
-    priceAtBet: "",
-    notes: ""
-  });
+  const [betForm, setBetForm] = useState(initialBetForm);
+  const [editingId, setEditingId] = useState<string | null>(null);
+  const [editingDraft, setEditingDraft] = useState<Partial<ManualBet>>({});
 
-  const { data: bets = [], isLoading } = useQuery<UserBet[]>({
+  const { data: bets = [], isLoading } = useQuery<ManualBet[]>({
     queryKey: ["/api/bets"],
-    select: (data: any[]) => data.filter(bet => bet.settlement === "pending")
   });
 
-  const addBetMutation = useMutation({
-    mutationFn: async (betData: any) => {
-      await apiRequest("POST", "/api/bets", betData);
+  const createBet = useMutation({
+    mutationFn: async (payload: typeof initialBetForm) => {
+      await apiRequest("POST", "/api/bets", {
+        ...payload,
+        oddsAmerican: Number(payload.oddsAmerican),
+        stake: Number(payload.stake),
+      });
     },
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ["/api/bets"] });
-      setShowAddBet(false);
-      setNewBet({
-        eventId: "",
-        marketId: "",
-        sportsbookId: "",
-        outcomeId: "",
-        stake: "",
-        priceAtBet: "",
-        notes: ""
-      });
-      toast({
-        title: "Success",
-        description: "Bet added successfully",
-      });
+      setBetForm(initialBetForm);
+      toast({ title: "Bet added", description: "Manual bet saved to your tracker." });
     },
     onError: () => {
       toast({
-        title: "Error",
-        description: "Failed to add bet",
+        title: "Unable to save bet",
+        description: "Please check your entry and try again.",
         variant: "destructive",
       });
-    }
+    },
   });
 
-  const trackBetMutation = useMutation({
-    mutationFn: async (betId: string) => {
-      await apiRequest("POST", `/api/bets/${betId}/track`);
+  const updateBet = useMutation({
+    mutationFn: async ({ id, payload }: { id: string; payload: Partial<ManualBet> }) => {
+      await apiRequest("PUT", `/api/bets/${id}`, payload);
     },
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ["/api/bets"] });
-      toast({
-        title: "Success",
-        description: "Bet tracking enabled",
-      });
-    }
-  });
-
-  const untrackBetMutation = useMutation({
-    mutationFn: async (betId: string) => {
-      await apiRequest("POST", `/api/bets/${betId}/untrack`);
+      setEditingId(null);
+      setEditingDraft({});
+      toast({ title: "Bet updated", description: "Changes saved." });
     },
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ["/api/bets"] });
+    onError: () => {
       toast({
-        title: "Success", 
-        description: "Bet tracking disabled",
+        title: "Update failed",
+        description: "Could not update bet. Please try again.",
+        variant: "destructive",
       });
-    }
+    },
   });
 
-  const handleAddBet = () => {
-    addBetMutation.mutate(newBet);
-  };
-
-  const handleToggleTracking = (bet: UserBet) => {
-    if (bet.isTracked) {
-      untrackBetMutation.mutate(bet.id);
-    } else {
-      trackBetMutation.mutate(bet.id);
+  const handleSubmit = () => {
+    // Keep the flow lightweight: only selection is required, everything else can fall back to defaults
+    if (!betForm.selection) {
+      toast({
+        title: "Add a selection",
+        description: "Enter the side or player you backed.",
+        variant: "destructive",
+      });
+      return;
     }
+
+    const odds = Number(betForm.oddsAmerican);
+    const stake = Number(betForm.stake);
+
+    const payload = {
+      sport: betForm.sport || "Unknown",
+      sportsbook: betForm.sportsbook || "Unspecified",
+      marketType: betForm.marketType || "Moneyline",
+      league: betForm.league,
+      homeTeam: betForm.homeTeam,
+      awayTeam: betForm.awayTeam,
+      selection: betForm.selection,
+      oddsAmerican: Number.isFinite(odds) ? String(odds) : "-110",
+      stake: Number.isFinite(stake) ? String(stake) : "0",
+      status: betForm.status || "open",
+      notes: betForm.notes,
+    };
+
+    setBetForm(payload);
+    createBet.mutate(payload);
   };
 
-  const trackedBets = bets.filter(bet => bet.isTracked);
-  const untrackedBets = bets.filter(bet => !bet.isTracked);
+  const startEditing = (bet: ManualBet) => {
+    setEditingId(bet.id);
+    setEditingDraft({
+      selection: bet.selection,
+      sportsbook: bet.sportsbook,
+      oddsAmerican: bet.oddsAmerican,
+      stake: bet.stake,
+      notes: bet.notes ?? "",
+      status: bet.status,
+    });
+  };
+
+  const saveEditing = () => {
+    if (!editingId) return;
+    const payload: Partial<ManualBet> = { ...editingDraft };
+
+    if (payload.oddsAmerican !== undefined) {
+      payload.oddsAmerican = Number(payload.oddsAmerican);
+    }
+
+    if (payload.stake !== undefined) {
+      payload.stake = typeof payload.stake === "number" ? String(payload.stake) : payload.stake;
+    }
+
+    updateBet.mutate({ id: editingId, payload });
+  };
 
   return (
     <div className="space-y-8">
-      {/* Header */}
       <div className="flex items-center justify-between">
         <div>
-          <h1 className="text-2xl font-bold">Hedge Center</h1>
-          <p className="text-sm text-muted-foreground">Manage your bets and monitor hedge opportunities</p>
+          <h1 className="text-2xl font-bold">Hedge Center / Bet Tracker</h1>
+          <p className="text-sm text-muted-foreground">
+            Manually record wagers, update their status, and keep a clean ledger for hedging.
+          </p>
         </div>
-        <Dialog open={showAddBet} onOpenChange={setShowAddBet}>
-          <DialogTrigger asChild>
-            <Button data-testid="button-add-bet">
-              <Plus className="w-4 h-4 mr-2" />
-              Add Bet
+        <Badge variant="outline">Manual entry only</Badge>
+      </div>
+
+      <Card>
+        <CardHeader>
+          <CardTitle className="flex items-center gap-2">
+            <Plus className="w-4 h-4" /> Add bet
+          </CardTitle>
+        </CardHeader>
+        <CardContent className="space-y-4">
+          <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+            <div className="space-y-2">
+              <Label>Sport</Label>
+              <Input
+                placeholder="NFL"
+                value={betForm.sport}
+                onChange={(e) => setBetForm((prev) => ({ ...prev, sport: e.target.value }))}
+              />
+            </div>
+            <div className="space-y-2">
+              <Label>League</Label>
+              <Input
+                placeholder="AFC East"
+                value={betForm.league}
+                onChange={(e) => setBetForm((prev) => ({ ...prev, league: e.target.value }))}
+              />
+            </div>
+            <div className="space-y-2">
+              <Label>Market</Label>
+              <Input
+                placeholder="Moneyline"
+                value={betForm.marketType}
+                onChange={(e) => setBetForm((prev) => ({ ...prev, marketType: e.target.value }))}
+              />
+            </div>
+          </div>
+
+          <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+            <div className="space-y-2">
+              <Label>Home team</Label>
+              <Input
+                placeholder="Team A"
+                value={betForm.homeTeam}
+                onChange={(e) => setBetForm((prev) => ({ ...prev, homeTeam: e.target.value }))}
+              />
+            </div>
+            <div className="space-y-2">
+              <Label>Away team</Label>
+              <Input
+                placeholder="Team B"
+                value={betForm.awayTeam}
+                onChange={(e) => setBetForm((prev) => ({ ...prev, awayTeam: e.target.value }))}
+              />
+            </div>
+            <div className="space-y-2">
+              <Label>Selection</Label>
+              <Input
+                placeholder="Jets +3.5"
+                value={betForm.selection}
+                onChange={(e) => setBetForm((prev) => ({ ...prev, selection: e.target.value }))}
+              />
+            </div>
+          </div>
+
+          <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
+            <div className="space-y-2">
+              <Label>Sportsbook</Label>
+              <Input
+                placeholder="DraftKings"
+                value={betForm.sportsbook}
+                onChange={(e) => setBetForm((prev) => ({ ...prev, sportsbook: e.target.value }))}
+              />
+            </div>
+            <div className="space-y-2">
+              <Label>Odds (American)</Label>
+              <Input
+                placeholder="-110"
+                value={betForm.oddsAmerican}
+                onChange={(e) => setBetForm((prev) => ({ ...prev, oddsAmerican: e.target.value }))}
+              />
+            </div>
+            <div className="space-y-2">
+              <Label>Stake</Label>
+              <Input
+                placeholder="50"
+                value={betForm.stake}
+                onChange={(e) => setBetForm((prev) => ({ ...prev, stake: e.target.value }))}
+              />
+            </div>
+            <div className="space-y-2">
+              <Label>Status</Label>
+              <Select
+                value={betForm.status}
+                onValueChange={(value) => setBetForm((prev) => ({ ...prev, status: value }))}
+              >
+                <SelectTrigger>
+                  <SelectValue placeholder="Status" />
+                </SelectTrigger>
+                <SelectContent>
+                  {statusOptions.map((status) => (
+                    <SelectItem key={status} value={status}>
+                      {status}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            </div>
+          </div>
+
+          <div className="space-y-2">
+            <Label>Notes</Label>
+            <Textarea
+              placeholder="Limits, boosts, or hedge plan"
+              value={betForm.notes}
+              onChange={(e) => setBetForm((prev) => ({ ...prev, notes: e.target.value }))}
+            />
+          </div>
+
+          <div className="flex justify-end">
+            <Button onClick={handleSubmit} disabled={createBet.isPending}>
+              {createBet.isPending ? "Saving..." : "Add bet"}
             </Button>
-          </DialogTrigger>
-          <DialogContent>
-            <DialogHeader>
-              <DialogTitle>Add New Bet</DialogTitle>
-            </DialogHeader>
-            <div className="space-y-4">
-              <div className="grid grid-cols-2 gap-4">
-                <div className="space-y-2">
-                  <Label htmlFor="stake">Stake ($)</Label>
-                  <Input
-                    id="stake"
-                    type="number"
-                    placeholder="100"
-                    value={newBet.stake}
-                    onChange={(e) => setNewBet(prev => ({ ...prev, stake: e.target.value }))}
-                    data-testid="input-bet-stake"
-                  />
-                </div>
-                <div className="space-y-2">
-                  <Label htmlFor="odds">Odds</Label>
-                  <Input
-                    id="odds"
-                    placeholder="+110"
-                    value={newBet.priceAtBet}
-                    onChange={(e) => setNewBet(prev => ({ ...prev, priceAtBet: e.target.value }))}
-                    data-testid="input-bet-odds"
-                  />
-                </div>
-              </div>
+          </div>
+        </CardContent>
+      </Card>
 
-              <div className="space-y-2">
-                <Label htmlFor="sportsbook">Sportsbook</Label>
-                <Select 
-                  value={newBet.sportsbookId} 
-                  onValueChange={(value) => setNewBet(prev => ({ ...prev, sportsbookId: value }))}
-                >
-                  <SelectTrigger data-testid="select-sportsbook">
-                    <SelectValue placeholder="Select sportsbook" />
-                  </SelectTrigger>
-                  <SelectContent>
-                    <SelectItem value="draftkings">DraftKings</SelectItem>
-                    <SelectItem value="fanduel">FanDuel</SelectItem>
-                    <SelectItem value="caesars">Caesars</SelectItem>
-                    <SelectItem value="betmgm">BetMGM</SelectItem>
-                  </SelectContent>
-                </Select>
-              </div>
-
-              <div className="space-y-2">
-                <Label htmlFor="outcome">Outcome/Selection</Label>
-                <Input
-                  id="outcome"
-                  placeholder="Lakers +6.5"
-                  value={newBet.outcomeId}
-                  onChange={(e) => setNewBet(prev => ({ ...prev, outcomeId: e.target.value }))}
-                  data-testid="input-bet-outcome"
-                />
-              </div>
-
-              <div className="space-y-2">
-                <Label htmlFor="notes">Notes (Optional)</Label>
-                <Textarea
-                  id="notes"
-                  placeholder="Additional notes about this bet..."
-                  value={newBet.notes}
-                  onChange={(e) => setNewBet(prev => ({ ...prev, notes: e.target.value }))}
-                  data-testid="textarea-bet-notes"
-                />
-              </div>
-
-              <div className="flex gap-2 pt-4">
-                <Button 
-                  variant="outline" 
-                  onClick={() => setShowAddBet(false)}
-                  className="flex-1"
-                  data-testid="button-cancel-bet"
-                >
-                  Cancel
-                </Button>
-                <Button 
-                  onClick={handleAddBet}
-                  disabled={addBetMutation.isPending}
-                  className="flex-1"
-                  data-testid="button-save-bet"
-                >
-                  {addBetMutation.isPending ? "Adding..." : "Add Bet"}
-                </Button>
-              </div>
+      <Card>
+        <CardHeader>
+          <CardTitle className="flex items-center gap-2">
+            <Shield className="w-4 h-4" /> Bet tracker ({bets.length})
+          </CardTitle>
+        </CardHeader>
+        <CardContent>
+          {isLoading ? (
+            <div className="space-y-2">
+              {[1, 2, 3].map((i) => (
+                <div key={i} className="h-12 bg-muted animate-pulse rounded" />
+              ))}
             </div>
-          </DialogContent>
-        </Dialog>
-      </div>
-
-      {/* Summary Stats */}
-      <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
-        <Card>
-          <CardContent className="p-6">
-            <div className="flex items-center justify-between">
-              <div>
-                <p className="text-sm text-muted-foreground">Total Bets</p>
-                <p className="text-2xl font-bold">{bets.length}</p>
-              </div>
-              <Shield className="w-8 h-8 text-primary" />
+          ) : bets.length === 0 ? (
+            <p className="text-sm text-muted-foreground">No bets recorded yet.</p>
+          ) : (
+            <div className="overflow-x-auto">
+              <table className="w-full text-sm">
+                <thead className="text-left text-muted-foreground">
+                  <tr>
+                    <th className="p-2">Selection</th>
+                    <th className="p-2">Market</th>
+                    <th className="p-2">Sportsbook</th>
+                    <th className="p-2">Odds</th>
+                    <th className="p-2">Stake</th>
+                    <th className="p-2">Status</th>
+                    <th className="p-2">Notes</th>
+                    <th className="p-2 text-right">Actions</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y">
+                  {bets.map((bet) => {
+                    const isEditing = editingId === bet.id;
+                    return (
+                      <tr key={bet.id} className="align-top">
+                        <td className="p-2 font-medium">
+                          {isEditing ? (
+                            <Input
+                              value={editingDraft.selection ?? ""}
+                              onChange={(e) =>
+                                setEditingDraft((prev) => ({ ...prev, selection: e.target.value }))
+                              }
+                            />
+                          ) : (
+                            bet.selection
+                          )}
+                          <div className="text-xs text-muted-foreground">
+                            {bet.homeTeam && bet.awayTeam
+                              ? `${bet.homeTeam} vs ${bet.awayTeam}`
+                              : bet.league || bet.sport}
+                          </div>
+                        </td>
+                        <td className="p-2">{bet.marketType}</td>
+                        <td className="p-2">
+                          {isEditing ? (
+                            <Input
+                              value={editingDraft.sportsbook ?? ""}
+                              onChange={(e) =>
+                                setEditingDraft((prev) => ({ ...prev, sportsbook: e.target.value }))
+                              }
+                            />
+                          ) : (
+                            bet.sportsbook
+                          )}
+                        </td>
+                        <td className="p-2">
+                          {isEditing ? (
+                            <Input
+                              value={editingDraft.oddsAmerican ?? bet.oddsAmerican}
+                              onChange={(e) =>
+                                setEditingDraft((prev) => ({ ...prev, oddsAmerican: Number(e.target.value) }))
+                              }
+                            />
+                          ) : (
+                            bet.oddsAmerican
+                          )}
+                        </td>
+                        <td className="p-2">
+                          {isEditing ? (
+                            <Input
+                              value={editingDraft.stake ?? bet.stake}
+                              onChange={(e) =>
+                                setEditingDraft((prev) => ({ ...prev, stake: e.target.value }))
+                              }
+                            />
+                          ) : (
+                            `$${Number(bet.stake).toLocaleString()}`
+                          )}
+                        </td>
+                        <td className="p-2">
+                          {isEditing ? (
+                            <Select
+                              value={editingDraft.status ?? bet.status}
+                              onValueChange={(value) =>
+                                setEditingDraft((prev) => ({ ...prev, status: value }))
+                              }
+                            >
+                              <SelectTrigger>
+                                <SelectValue placeholder="Status" />
+                              </SelectTrigger>
+                              <SelectContent>
+                                {statusOptions.map((status) => (
+                                  <SelectItem key={status} value={status}>
+                                    {status}
+                                  </SelectItem>
+                                ))}
+                              </SelectContent>
+                            </Select>
+                          ) : (
+                            <Badge variant="outline">{bet.status}</Badge>
+                          )}
+                        </td>
+                        <td className="p-2 w-64">
+                          {isEditing ? (
+                            <Textarea
+                              value={editingDraft.notes ?? bet.notes ?? ""}
+                              onChange={(e) =>
+                                setEditingDraft((prev) => ({ ...prev, notes: e.target.value }))
+                              }
+                            />
+                          ) : (
+                            <span className="line-clamp-2 text-xs text-muted-foreground">{bet.notes}</span>
+                          )}
+                        </td>
+                        <td className="p-2 text-right">
+                          {isEditing ? (
+                            <div className="flex justify-end gap-2">
+                              <Button size="sm" variant="outline" onClick={() => setEditingId(null)}>
+                                <XCircle className="w-4 h-4 mr-1" /> Cancel
+                              </Button>
+                              <Button size="sm" onClick={saveEditing} disabled={updateBet.isPending}>
+                                <Save className="w-4 h-4 mr-1" /> Save
+                              </Button>
+                            </div>
+                          ) : (
+                            <Button size="sm" variant="ghost" onClick={() => startEditing(bet)}>
+                              <Edit3 className="w-4 h-4 mr-1" /> Edit
+                            </Button>
+                          )}
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
             </div>
-          </CardContent>
-        </Card>
-
-        <Card>
-          <CardContent className="p-6">
-            <div className="flex items-center justify-between">
-              <div>
-                <p className="text-sm text-muted-foreground">Tracked Bets</p>
-                <p className="text-2xl font-bold text-blue-500">{trackedBets.length}</p>
-              </div>
-              <Eye className="w-8 h-8 text-blue-500" />
-            </div>
-          </CardContent>
-        </Card>
-
-        <Card>
-          <CardContent className="p-6">
-            <div className="flex items-center justify-between">
-              <div>
-                <p className="text-sm text-muted-foreground">Hedge Alerts</p>
-                <p className="text-2xl font-bold text-amber-500">{Math.floor(trackedBets.length * 0.3)}</p>
-              </div>
-              <AlertTriangle className="w-8 h-8 text-amber-500" />
-            </div>
-          </CardContent>
-        </Card>
-      </div>
-
-      <div className="grid grid-cols-1 lg:grid-cols-2 gap-8">
-        {/* Tracked Bets with Hedge Monitoring */}
-        <Card>
-          <CardHeader>
-            <CardTitle className="flex items-center gap-2">
-              <Eye className="w-4 h-4" />
-              Tracked Bets ({trackedBets.length})
-            </CardTitle>
-          </CardHeader>
-          <CardContent>
-            {trackedBets.length > 0 ? (
-              <div className="space-y-4">
-                {trackedBets.map((bet) => (
-                  <div key={bet.id} className="border border-border rounded-lg p-4">
-                    <div className="flex items-start justify-between mb-3">
-                      <div>
-                        <h3 className="font-medium text-sm">{bet.outcomeId}</h3>
-                        <p className="text-xs text-muted-foreground">
-                          ${parseFloat(bet.stake).toLocaleString()} at {bet.priceAtBet}
-                        </p>
-                      </div>
-                      <div className="flex items-center gap-2">
-                        <Badge variant="secondary" className="bg-blue-500/10 text-blue-500">
-                          Tracking
-                        </Badge>
-                        <Button
-                          size="sm"
-                          variant="ghost"
-                          onClick={() => handleToggleTracking(bet)}
-                          data-testid={`button-untrack-${bet.id}`}
-                        >
-                          <EyeOff className="w-4 h-4" />
-                        </Button>
-                      </div>
-                    </div>
-
-                    {/* Example hedge suggestion UI could go here */}
-                    <div className="bg-amber-500/10 border border-amber-500/20 rounded-lg p-3 mt-3">
-                      <div className="flex items-center gap-2 mb-2">
-                        <AlertTriangle className="w-4 h-4 text-amber-500" />
-                        <span className="text-sm font-medium text-amber-500">Hedge Opportunity</span>
-                      </div>
-                      <p className="text-xs text-muted-foreground mb-2">
-                        Opposing bet at +102 • Stake: $445 • Lock profit: $67-$89
-                      </p>
-                      <div className="flex gap-2">
-                        <Button size="sm" variant="outline" data-testid={`button-review-hedge-${bet.id}`}>
-                          Review
-                        </Button>
-                        <Button size="sm" data-testid={`button-execute-hedge-${bet.id}`}>
-                          Execute
-                        </Button>
-                      </div>
-                    </div>
-                  </div>
-                ))}
-              </div>
-            ) : (
-              <div className="text-center py-8 text-muted-foreground">
-                <Eye className="w-12 h-12 mx-auto mb-4 opacity-50" />
-                <p>No bets are currently being tracked</p>
-                <p className="text-xs mt-1">Enable tracking on bets below to monitor hedge opportunities</p>
-              </div>
-            )}
-          </CardContent>
-        </Card>
-
-        {/* All Bets */}
-        <Card>
-          <CardHeader>
-            <CardTitle className="flex items-center gap-2">
-              <Shield className="w-4 h-4" />
-              All Bets ({bets.length})
-            </CardTitle>
-          </CardHeader>
-          <CardContent>
-            {isLoading ? (
-              <div className="space-y-4">
-                {[1, 2, 3].map(i => (
-                  <div key={i} className="animate-pulse">
-                    <div className="h-16 bg-muted rounded-lg"></div>
-                  </div>
-                ))}
-              </div>
-            ) : bets.length > 0 ? (
-              <div className="space-y-4">
-                {bets.map((bet) => (
-                  <div key={bet.id} className="border border-border rounded-lg p-4">
-                    <div className="flex items-start justify-between">
-                      <div>
-                        <h3 className="font-medium text-sm">{bet.outcomeId}</h3>
-                        <p className="text-xs text-muted-foreground">
-                          ${parseFloat(bet.stake).toLocaleString()} at {bet.priceAtBet}
-                        </p>
-                        {bet.notes && (
-                          <p className="text-xs text-muted-foreground mt-1">{bet.notes}</p>
-                        )}
-                      </div>
-                      <div className="flex items-center gap-2">
-                        <Badge 
-                          variant={bet.isTracked ? "secondary" : "outline"}
-                          className={bet.isTracked ? "bg-blue-500/10 text-blue-500" : ""}
-                        >
-                          {bet.isTracked ? "Tracked" : "Untracked"}
-                        </Badge>
-                        <Button
-                          size="sm"
-                          variant="ghost"
-                          onClick={() => handleToggleTracking(bet)}
-                          data-testid={`button-toggle-tracking-${bet.id}`}
-                        >
-                          {bet.isTracked ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
-                        </Button>
-                      </div>
-                    </div>
-                  </div>
-                ))}
-              </div>
-            ) : (
-              <div className="text-center py-8 text-muted-foreground">
-                <Shield className="w-12 h-12 mx-auto mb-4 opacity-50" />
-                <h3 className="font-medium mb-2">No Bets Found</h3>
-                <p className="text-sm">Add your first bet to start monitoring hedge opportunities</p>
-              </div>
-            )}
-          </CardContent>
-        </Card>
-      </div>
+          )}
+        </CardContent>
+      </Card>
     </div>
   );
 }

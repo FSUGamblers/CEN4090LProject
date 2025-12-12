@@ -10,8 +10,6 @@ import {
   Activity,
   DollarSign,
   Settings,
-  UserCheck,
-  FileText,
   LogOut,
   User,
   Cpu, // safe icon for Agent Scan
@@ -33,11 +31,6 @@ const navigationItems: NavItem[] = [
   { name: "PnL & Expenses", href: "/pnl", icon: DollarSign },
   { name: "Jobs & Polling", href: "/jobs", icon: Settings },
   { name: "Agent Scan", href: "/agent-scan", icon: Cpu }, // ← moved here
-];
-
-const adminItems: NavItem[] = [
-  { name: "Admin", href: "/admin", icon: UserCheck },
-  { name: "Audit Logs", href: "/audit-logs", icon: FileText },
 ];
 
 function NavSection({
@@ -120,7 +113,6 @@ export default function Sidebar() {
       {/* Navigation */}
       <nav className="flex-1 p-4 space-y-2">
         <NavSection items={navigationItems} location={location} />
-        <NavSection items={adminItems} location={location} topBorder />
       </nav>
 
       {/* User Profile */}

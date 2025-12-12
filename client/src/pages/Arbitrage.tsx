@@ -1,5 +1,5 @@
-import { useState } from "react";
-import { useQuery, useMutation } from "@tanstack/react-query";
+import { useEffect, useState } from "react";
+import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -18,6 +18,13 @@ import ArbitrageCard from "@/components/ArbitrageCard";
 import { useToast } from "@/hooks/use-toast";
 import { apiRequest } from "@/lib/queryClient";
 import {
+  LAST_ARBITRAGE_SCAN_QUERY_KEY,
+  type ArbitrageScanResult,
+  normalizeAgentResult,
+  persistCachedScan,
+  readCachedScan,
+} from "@/lib/arbitrageCache";
+import {
   Search,
   Filter,
   TrendingUp,
@@ -35,156 +42,10 @@ interface ScanRequest {
   regions?: string[];
   markets?: string[];
   minProfitPct?: number;
-  useCachedOdds?: boolean; 
-}
-
-
-/**
- * IMPORTANT: In the agent response, each leg's `stake` is in basis points of
- * some notional bankroll (e.g., 5000 = 50% of bankroll).
- * We normalize that into `stakeBps` for display as "% of bankroll".
- */
-interface MaxProfitPick {
-  eventId?: string;
-  marketId?: string;
-  eventName?: string;
-  marketType?: string;
-  description?: string;
-  legs: Array<{
-    outcome: string;
-    sportsbook: string;
-    odds: string;
-    // basis points of bankroll: 5000 -> 50% of bankroll
-    stakeBps: number;
-  }>;
-  // Expected locked profit as a percentage of bankroll (e.g., 1.5 = 1.5%)
-  expectedProfitPct: number;
-  // Confidence already normalized to 0–100 (we will display as "%")
-  confidenceScore: number;
-}
-
-interface ArbitrageScanResult {
-  success: boolean;
-  maxProfitPick?: MaxProfitPick;
-  /**
-   * All opportunities returned by the scan, already ranked by edge/safety.
-   * We mirror `rankedOpportunities` from the backend so the UI always has
-   * a consistent list to work with.
-   */
-  allOpportunities: ArbitrageOpportunityDisplay[];
-  rankedOpportunities: ArbitrageOpportunityDisplay[];
-  creditUsage: {
-    requestsUsed: number;
-    creditsConsumed: number;
-  };
-  cacheExpiresAt: string;
-}
-
-/* -------------------- Normalization helpers -------------------- */
-
-function normalizeConfidence(raw: unknown): number {
-  const num = typeof raw === "number" ? raw : Number(raw);
-  if (!Number.isFinite(num) || num <= 0) return 0;
-
-  // Cases:
-  //  - 0–1  -> treat as probability, convert to %
-  //  - 1–100 -> already a percent
-  //  - >100  -> assume basis points style (e.g. 9500 -> 95%), clamp to 100
-  if (num <= 1) return num * 100;
-  if (num <= 100) return num;
-  return Math.min(100, num / 100);
-}
-
-function normalizeMaxProfitPick(raw: any | undefined | null): MaxProfitPick | undefined {
-  if (!raw) return undefined;
-
-  // Profit: prefer expectedProfitPct, fall back to profitPct/bestProfitPct
-  const profitSource =
-    typeof raw.expectedProfitPct === "number"
-      ? raw.expectedProfitPct
-      : typeof raw.profitPct === "number"
-      ? raw.profitPct
-      : typeof raw.bestProfitPct === "number"
-      ? raw.bestProfitPct
-      : 0;
-
-  const expectedProfitPct = Number.isFinite(profitSource) ? Number(profitSource) : 0;
-
-  const legs = Array.isArray(raw.legs)
-    ? raw.legs.map((leg: any) => ({
-        outcome: String(leg.outcome ?? leg.label ?? leg.outcomeLabel ?? ""),
-        sportsbook: String(leg.sportsbook ?? leg.book ?? leg.bookName ?? ""),
-        odds:
-          typeof leg.odds === "number"
-            ? leg.odds.toString()
-            : String(leg.odds ?? ""),
-        // Treat raw `stake` as basis points of bankroll if provided,
-        // otherwise fall back to any existing stakeBps-like field.
-        stakeBps: Number(leg.stake ?? leg.stakeBps ?? 0),
-      }))
-    : [];
-
-  const confidenceScore = normalizeConfidence(raw.confidenceScore);
-
-  return {
-    eventId: raw.eventId ?? raw.event?.id,
-    marketId: raw.marketId ?? raw.market?.id ?? raw.marketType,
-    eventName:
-      raw.eventName ??
-      raw.event?.name ??
-      (raw.event?.homeTeam && raw.event?.awayTeam
-        ? `${raw.event.homeTeam} vs ${raw.event.awayTeam}`
-        : undefined),
-    marketType: raw.marketType ?? raw.market?.type,
-    description: raw.market?.description ?? raw.description,
-    legs,
-    expectedProfitPct,
-    confidenceScore,
-  };
+  useCachedOdds?: boolean;
 }
 
 /* -------------------- Agent bridge -------------------- */
-/** Normalizes any agent response shape into ArbitrageScanResult */
-function normalizeAgentResult(payload: any): ArbitrageScanResult {
-  // Backend returns the result at the top-level; keep support for { result: {...} } too.
-  const root = payload?.result ?? payload ?? {};
-
-  const maxProfitPick = normalizeMaxProfitPick(
-    root.maxProfitPick ?? root.bestOpportunity ?? root.topOpportunity
-  );
-
-  // Prefer the new backend field `rankedOpportunities`, but still support
-  // older shapes (`allOpportunities` / `opportunities`) for flexibility.
-  const rawList =
-    root.rankedOpportunities ??
-    root.allOpportunities ??
-    root.opportunities ??
-    [];
-
-  const normalizedList: ArbitrageOpportunityDisplay[] = Array.isArray(rawList)
-    ? (rawList as ArbitrageOpportunityDisplay[])
-    : [];
-
-  const creditUsage = {
-    requestsUsed: Number(root.creditUsage?.requestsUsed ?? root.requestsUsed ?? 0) || 0,
-    creditsConsumed:
-      Number(root.creditUsage?.creditsConsumed ?? root.creditsConsumed ?? 0) || 0,
-  };
-
-  const cacheExpiresAt: string =
-    typeof root.cacheExpiresAt === "string"
-      ? root.cacheExpiresAt
-      : new Date(Date.now() + 5 * 60 * 1000).toISOString(); // default 5m
-
-  return {
-    success: typeof payload?.success === "boolean" ? payload.success : true,
-    maxProfitPick,
-    allOpportunities: normalizedList,
-    rankedOpportunities: normalizedList,
-    creditUsage,
-    cacheExpiresAt,
-  };
-}
 
 /** Calls the credit-conscious arbitrage scan endpoint. */
 async function runAgentScan(request: ScanRequest): Promise<ArbitrageScanResult> {
@@ -202,6 +63,7 @@ async function runAgentScan(request: ScanRequest): Promise<ArbitrageScanResult> 
 /* -------------------- Component -------------------- */
 export default function Arbitrage() {
   const { toast } = useToast();
+  const queryClient = useQueryClient();
   // Shared active opportunities from backend (any page / previous scans)
   const { data: activeOpportunities = [], isLoading: activeOppLoading } =
     useQuery<ArbitrageOpportunityDisplay[]>({
@@ -210,6 +72,15 @@ export default function Arbitrage() {
 
   const [scanResults, setScanResults] = useState<ArbitrageScanResult | null>(null);
   const [lastScanTime, setLastScanTime] = useState<Date | null>(null);
+
+  useEffect(() => {
+    const cached = readCachedScan();
+    if (!cached) return;
+
+    setScanResults(cached.scanResults);
+    setLastScanTime(cached.lastScanTime ? new Date(cached.lastScanTime) : null);
+    queryClient.setQueryData(LAST_ARBITRAGE_SCAN_QUERY_KEY, cached);
+  }, [queryClient]);
 
   const [filters, setFilters] = useState<ScanRequest>({
     // NOTE: The "states" here are Odds-API sports keys, which is a bit misnamed,
@@ -236,7 +107,14 @@ export default function Arbitrage() {
     mutationFn: async (request: ScanRequest) => runAgentScan(request),
     onSuccess: (data) => {
       setScanResults(data);
-      setLastScanTime(new Date());
+      const now = new Date();
+      setLastScanTime(now);
+
+      const cachePayload = { scanResults: data, lastScanTime: now.toISOString() };
+
+      persistCachedScan(cachePayload);
+      queryClient.setQueryData(LAST_ARBITRAGE_SCAN_QUERY_KEY, cachePayload);
+
       toast({
         title: "Agent Scan Complete",
         description: `Found ${data.allOpportunities?.length || 0} opportunities. Credits used: ${

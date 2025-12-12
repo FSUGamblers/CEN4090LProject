@@ -1,5 +1,5 @@
-import { useState } from "react";
-import { useQuery } from "@tanstack/react-query";
+import { useEffect, useState } from "react";
+import { useMutation } from "@tanstack/react-query";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -9,89 +9,71 @@ import { Badge } from "@/components/ui/badge";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { Skeleton } from "@/components/ui/skeleton";
 import { useToast } from "@/hooks/use-toast";
-import { Search, Filter, Activity, Clock, TrendingUp, Building2, MapPin } from "lucide-react";
-
-interface LineData {
-  id: string;
-  marketId: string;
-  sportsbookId: string;
-  outcomeId: string;
-  priceFormat: string;
-  priceValue: string;
-  isLive: boolean;
-  stateAvailability: string[];
-  sourceLatencyMs?: number;
-  timestamp: string;
-  sportsbook: {
-    id: string;
-    name: string;
-    logoUrl?: string;
-  };
-  market: {
-    id: string;
-    marketType: string;
-    outcomes: Array<{ id: string; label: string }>;
-    event: {
-      id: string;
-      startTime: string;
-      status: string;
-      sport: {
-        id: string;
-        name: string;
-        code: string;
-      };
-      league: {
-        id: string;
-        name: string;
-        region?: string;
-      };
-      homeTeam?: {
-        id: string;
-        name: string;
-        shortName?: string;
-      };
-      awayTeam?: {
-        id: string;
-        name: string;
-        shortName?: string;
-      };
-    };
-  };
-}
-
-interface LinesFilters {
-  sport?: string;
-  state?: string;
-  marketType?: string;
-  live?: string;
-  event?: string;
-  search?: string;
-}
+import type { LineData, LinesFilters } from "@/types/lines";
+import { Search, Filter, Activity, Clock, TrendingUp, Building2, MapPin, RefreshCcw } from "lucide-react";
 
 export default function Lines() {
   const { toast } = useToast();
+  const [lines, setLines] = useState<LineData[]>([]);
   const [filters, setFilters] = useState<LinesFilters>({});
+  const [hasShownError, setHasShownError] = useState(false);
+  const [lastFetched, setLastFetched] = useState<Date | null>(null);
 
-  // Fetch lines data
-  const { data: lines, isLoading, error } = useQuery<LineData[]>({
-    queryKey: ['/api/lines', filters],
-    queryFn: async () => {
+  const fetchLinesMutation = useMutation({
+    mutationFn: async (currentFilters: LinesFilters) => {
       const params = new URLSearchParams();
-      if (filters.sport) params.append('sport', filters.sport);
-      if (filters.state) params.append('state', filters.state);
-      if (filters.marketType) params.append('market_type', filters.marketType);
-      if (filters.live) params.append('live', filters.live);
-      if (filters.event) params.append('event', filters.event);
-      
+      if (currentFilters.sport) params.append('sport', currentFilters.sport);
+      if (currentFilters.state) params.append('state', currentFilters.state);
+      if (currentFilters.marketType) params.append('market_type', currentFilters.marketType);
+      if (currentFilters.live) params.append('live', currentFilters.live);
+      if (currentFilters.event) params.append('event', currentFilters.event);
+
       const response = await fetch(`/api/lines?${params.toString()}`, {
         credentials: 'include'
       });
       if (!response.ok) {
         throw new Error('Failed to fetch lines');
       }
-      return response.json();
+      const data = await response.json();
+      return { data, currentFilters };
+    },
+    onSuccess: ({ data, currentFilters }) => {
+      setLines(data);
+      const now = new Date();
+      setLastFetched(now);
+
+      setHasShownError(false);
+
+      toast({
+        title: "Lines Updated",
+        description: `Fetched ${data.length} lines.`,
+      });
+    },
+    onError: () => {
+      if (hasShownError) return;
+
+      toast({
+        title: "Error Loading Lines",
+        description: "Failed to load lines data. Please try again.",
+        variant: "destructive",
+      });
+      setHasShownError(true);
     },
   });
+
+  const handleFetchLines = () => {
+    fetchLinesMutation.mutate(filters);
+  };
+
+  const isLoading = fetchLinesMutation.isPending && lines.length === 0;
+
+  const validLastFetched = lastFetched && !isNaN(lastFetched.getTime()) ? lastFetched : null;
+
+  useEffect(() => {
+    if (!fetchLinesMutation.isError && hasShownError) {
+      setHasShownError(false);
+    }
+  }, [fetchLinesMutation.isError, hasShownError]);
 
   // Get unique values for filters
   const sports = Array.from(new Set(lines?.map(line => line.market.event.sport.code) || []));
@@ -147,14 +129,6 @@ export default function Lines() {
     return `Event ${event.id}`;
   };
 
-  if (error) {
-    toast({
-      title: "Error Loading Lines",
-      description: "Failed to load lines data. Please try again.",
-      variant: "destructive",
-    });
-  }
-
   return (
     <div className="space-y-8">
       {/* Header */}
@@ -165,12 +139,27 @@ export default function Lines() {
             View all stored odds data across events and sportsbooks
           </p>
         </div>
-        <div className="flex items-center gap-2">
-          {lines && (
+        <div className="flex items-center gap-3">
+          {validLastFetched && (
             <span className="text-sm text-muted-foreground">
-              Last updated: {new Date(Math.max(...lines.map(line => new Date(line.timestamp).getTime()))).toLocaleTimeString()}
+              Last updated: {validLastFetched.toLocaleTimeString()}
             </span>
           )}
+          <Button
+            onClick={handleFetchLines}
+            disabled={fetchLinesMutation.isPending}
+            data-testid="button-fetch-lines"
+          >
+            {fetchLinesMutation.isPending ? (
+              <>
+                <RefreshCcw className="w-4 h-4 mr-2 animate-spin" /> Fetching...
+              </>
+            ) : (
+              <>
+                <RefreshCcw className="w-4 h-4 mr-2" /> Fetch Lines
+              </>
+            )}
+          </Button>
         </div>
       </div>
 

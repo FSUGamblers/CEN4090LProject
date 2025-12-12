@@ -17,8 +17,8 @@ import {
 } from "@shared/schema";
 import { oddsService } from "./services/oddsService";
 import { arbitrageService, type EstimateRequest } from "./services/arbitrageService";
-import { hedgeService } from "./services/hedgeService";
 import { jobScheduler } from "./services/jobScheduler";
+import { computeHedgeCandidates } from "./services/hedgeService";
 import { featureFlagService } from "./services/featureFlagService";
 import { auditService } from "./services/auditService";
 // Lightweight bearer guard for machine-to-machine calls (e.g., n8n)
@@ -59,7 +59,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
   app.get('/api/dashboard/stats', isAuthenticated, async (req: any, res) => {
     try {
       const [arbitrageOpportunities, userBets, jobRuns] = await Promise.all([
-        storage.getArbitrageOpportunities(),
+        storage.getArbitrageOpportunities({ activeOnly: true }),
         storage.getUserBets(req.user.claims.sub),
         storage.getJobRuns(),
       ]);
@@ -85,7 +85,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
 
       const activeOpportunities = safeOpportunities.length;
 
-      const trackedBets = (userBets || []).filter((bet: any) => bet.isTracked).length;
+      const trackedBets = (userBets || []).length;
 
       const avgProfit =
         safeOpportunities.length > 0
@@ -504,17 +504,24 @@ export async function registerRoutes(app: Express): Promise<Server> {
       const betData = insertUserBetSchema.parse({
         ...req.body,
         userId: req.user.claims.sub,
+        isTracked: true,
       });
-      
+
       const bet = await storage.createUserBet(betData);
-      
+
       await auditService.log(req.user.claims.sub, 'bet_created', 'user_bet', bet.id, {
         stake: bet.stake,
-        eventId: bet.eventId,
+        sport: bet.sport,
+        selection: bet.selection,
       });
-      
+
       res.json(bet);
     } catch (error) {
+      if (error instanceof z.ZodError) {
+        console.warn('Validation failed for bet creation:', error.flatten());
+        return res.status(400).json({ message: 'Invalid bet payload', issues: error.flatten() });
+      }
+
       console.error("Error creating bet:", error);
       res.status(500).json({ message: "Failed to create bet" });
     }
@@ -547,43 +554,60 @@ export async function registerRoutes(app: Express): Promise<Server> {
     }
   });
 
-  app.get('/api/bets/:betId/hedge', isAuthenticated, async (req, res) => {
+  app.put('/api/bets/:betId', isAuthenticated, async (req: any, res) => {
     try {
-      const suggestions = await storage.getHedgeSuggestions(req.params.betId);
-      const latestSuggestion = suggestions[0] || null;
-      res.json(latestSuggestion);
+      const updateSchema = insertUserBetSchema.partial().pick({
+        stake: true,
+        oddsAmerican: true,
+        sportsbook: true,
+        selection: true,
+        status: true,
+        notes: true,
+      });
+
+      const updates = updateSchema.parse(req.body);
+      const bet = await storage.updateUserBet(req.params.betId, updates);
+      await auditService.log(req.user.claims.sub, 'bet_updated', 'user_bet', bet.id, updates);
+
+      res.json(bet);
     } catch (error) {
-      console.error("Error fetching hedge suggestion:", error);
-      res.status(500).json({ message: "Failed to fetch hedge suggestion" });
+      console.error("Error updating bet:", error);
+      res.status(500).json({ message: "Failed to update bet" });
     }
   });
 
-  app.post('/api/bets/:betId/track', isAuthenticated, async (req: any, res) => {
+  // Hedge candidate probe (uses delayed, DB-touching engine)
+  app.get('/api/hedge/candidates', isAuthenticated, async (req: any, res) => {
     try {
-      const bet = await storage.updateUserBet(req.params.betId, { isTracked: true });
-      
-      await auditService.log(req.user.claims.sub, 'bet_tracking_enabled', 'user_bet', bet.id, {});
-      
-      // Start hedge monitoring
-      await hedgeService.monitorBet(bet.id);
-      
-      res.json(bet);
+      const bets = await storage.getUserBets(req.user.claims.sub, { status: 'open' });
+      const hedges = await computeHedgeCandidates(req.user.claims.sub, bets);
+
+      res.json({
+        betsAnalyzed: bets.length,
+        candidates: hedges,
+      });
     } catch (error) {
-      console.error("Error tracking bet:", error);
-      res.status(500).json({ message: "Failed to track bet" });
+      console.error('Error computing hedge candidates:', error);
+      res.status(500).json({ message: 'Failed to compute hedge candidates' });
     }
   });
 
-  app.post('/api/bets/:betId/untrack', isAuthenticated, async (req: any, res) => {
+  app.delete('/api/bets/:betId', isAuthenticated, async (req: any, res) => {
     try {
-      const bet = await storage.updateUserBet(req.params.betId, { isTracked: false });
-      
-      await auditService.log(req.user.claims.sub, 'bet_tracking_disabled', 'user_bet', bet.id, {});
-      
-      res.json(bet);
+      const bet = await storage.getUserBet(req.params.betId);
+      if (!bet) {
+        return res.status(404).json({ message: "Bet not found" });
+      }
+
+      // Soft delete by marking status void for simplicity
+      const deleted = await storage.updateUserBet(req.params.betId, { status: 'void' });
+
+      await auditService.log(req.user.claims.sub, 'bet_deleted', 'user_bet', bet.id, {});
+
+      res.json(deleted);
     } catch (error) {
-      console.error("Error untracking bet:", error);
-      res.status(500).json({ message: "Failed to untrack bet" });
+      console.error("Error deleting bet:", error);
+      res.status(500).json({ message: "Failed to delete bet" });
     }
   });
 
@@ -786,19 +810,40 @@ app.post('/api/n8n/jobs/:name/run', requireBearerOrReject, async (req: any, res)
   // GET /api/arbitrage/opportunities - currently active value opportunities
   app.get("/api/arbitrage/opportunities", isAuthenticated, async (req: any, res) => {
     try {
-      // This uses your existing storage method; no new options needed.
-      const opportunities = await storage.getArbitrageOpportunities();
+      const opportunities = await storage.getArbitrageOpportunities({ activeOnly: true });
+      const sportsbooks = await storage.getSportsbooks();
+      const bookMap = new Map(sportsbooks.map((b) => [b.id, b.name]));
 
-      const now = new Date();
+      const formatted = await Promise.all(
+        opportunities.map(async (opp) => {
+          const event = opp.eventId ? await storage.getEventWithDetails(opp.eventId) : undefined;
 
-      // Keep only non-expired ones if expiresAt exists
-      const active = (opportunities || []).filter((opp: any) => {
-        if (!opp.expiresAt) return true;
-        return new Date(opp.expiresAt) > now;
-      });
+          return {
+            id: opp.id,
+            event: {
+              homeTeam: event?.homeTeam?.name ?? "Home",
+              awayTeam: event?.awayTeam?.name ?? "Away",
+              league: event?.league?.name ?? "",
+              startTime: event?.startTime?.toISOString?.() ?? "",
+            },
+            market: {
+              type: opp.marketId ?? "",
+              description: opp.validityWindow ? "Arbitrage" : "Value",
+            },
+            legs: (opp.legs || []).map((leg) => ({
+              outcome: leg.outcomeId,
+              sportsbook: bookMap.get(leg.sportsbookId) ?? leg.sportsbookId,
+              odds: Number(leg.priceValue).toString(),
+              stake: Number(leg.stakeFraction ?? 0) * 100,
+            })),
+            profitPct: Number(opp.expectedProfitPct ?? 0),
+            validityWindow: Number(opp.validityWindow ?? 300),
+            confidenceScore: Number(opp.confidenceScore ?? 0),
+          } as const;
+        })
+      );
 
-      // For now, just pass them through; the frontend will normalize.
-      res.json(active);
+      res.json(formatted);
     } catch (error) {
       console.error("Error fetching active arbitrage/value opportunities:", error);
       res.status(500).json({ message: "Failed to fetch opportunities" });

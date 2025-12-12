@@ -1,0 +1,48 @@
+{
+  "version": "7",
+  "dialect": "postgresql",
+  "entries": [
+    {
+      "idx": 0,
+      "version": "7",
+      "when": 1764985970629,
+      "tag": "0000_add_missing_user_bets_columns",
+      "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "7",
+      "when": 1764988409231,
+      "tag": "0001_convert_user_bets_id_to_uuid",
+      "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "7",
+      "when": 1764991484431,
+      "tag": "0002_set_default_cost_category",
+      "breakpoints": true
+    },
+    {
+      "idx": 3,
+      "version": "7",
+      "when": 1764991484432,
+      "tag": "0003_allow_nullable_event_id_user_bets",
+      "breakpoints": true
+    },
+    {
+      "idx": 4,
+      "version": "7",
+      "when": 1765560218000,
+      "tag": "0004_ensure_user_bets_event_id_nullable",
+      "breakpoints": true
+    },
+    {
+      "idx": 5,
+      "version": "7",
+      "when": 1765560219000,
+      "tag": "0005_force_user_bets_event_id_nullable",
+      "breakpoints": true
+    }
+  ]
+}
