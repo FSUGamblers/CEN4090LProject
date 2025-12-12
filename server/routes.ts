@@ -517,6 +517,11 @@ export async function registerRoutes(app: Express): Promise<Server> {
 
       res.json(bet);
     } catch (error) {
+      if (error instanceof z.ZodError) {
+        console.warn('Validation failed for bet creation:', error.flatten());
+        return res.status(400).json({ message: 'Invalid bet payload', issues: error.flatten() });
+      }
+
       console.error("Error creating bet:", error);
       res.status(500).json({ message: "Failed to create bet" });
     }
