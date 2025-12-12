@@ -59,7 +59,7 @@ export default function HedgeCenter() {
       await apiRequest("POST", "/api/bets", {
         ...betForm,
         oddsAmerican: Number(betForm.oddsAmerican),
-        stake: betForm.stake,
+        stake: Number(betForm.stake),
       });
     },
     onSuccess: () => {
@@ -100,6 +100,27 @@ export default function HedgeCenter() {
       toast({
         title: "Missing details",
         description: "Sport, selection, and sportsbook are required.",
+        variant: "destructive",
+      });
+      return;
+    }
+
+    const odds = Number(betForm.oddsAmerican);
+    const stake = Number(betForm.stake);
+
+    if (!Number.isFinite(odds) || betForm.oddsAmerican === "") {
+      toast({
+        title: "Odds required",
+        description: "Enter valid American odds (e.g., -110).",
+        variant: "destructive",
+      });
+      return;
+    }
+
+    if (!Number.isFinite(stake) || stake <= 0) {
+      toast({
+        title: "Stake required",
+        description: "Enter a positive stake amount.",
         variant: "destructive",
       });
       return;
