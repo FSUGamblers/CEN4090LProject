@@ -36,6 +36,13 @@
       "when": 1765560218000,
       "tag": "0004_ensure_user_bets_event_id_nullable",
       "breakpoints": true
+    },
+    {
+      "idx": 5,
+      "version": "7",
+      "when": 1765560219000,
+      "tag": "0005_force_user_bets_event_id_nullable",
+      "breakpoints": true
     }
   ]
 }
