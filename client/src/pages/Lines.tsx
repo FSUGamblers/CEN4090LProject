@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { useMutation, useQueryClient } from "@tanstack/react-query";
+import { useMutation } from "@tanstack/react-query";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -9,31 +9,15 @@ import { Badge } from "@/components/ui/badge";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { Skeleton } from "@/components/ui/skeleton";
 import { useToast } from "@/hooks/use-toast";
-import { LAST_LINES_QUERY_KEY, persistCachedLines, readCachedLines } from "@/lib/linesCache";
 import type { LineData, LinesFilters } from "@/types/lines";
 import { Search, Filter, Activity, Clock, TrendingUp, Building2, MapPin, RefreshCcw } from "lucide-react";
 
 export default function Lines() {
   const { toast } = useToast();
-  const queryClient = useQueryClient();
   const [lines, setLines] = useState<LineData[]>([]);
   const [filters, setFilters] = useState<LinesFilters>({});
   const [hasShownError, setHasShownError] = useState(false);
   const [lastFetched, setLastFetched] = useState<Date | null>(null);
-
-  useEffect(() => {
-    const cached = readCachedLines(filters);
-    if (cached) {
-      setLines(cached.lines);
-      setLastFetched(cached.lastFetched ? new Date(cached.lastFetched) : null);
-      queryClient.setQueryData(LAST_LINES_QUERY_KEY, cached);
-      return;
-    }
-
-    // Clear stale lines when filters change and no matching cache is found
-    setLines([]);
-    setLastFetched(null);
-  }, [filters, queryClient]);
 
   const fetchLinesMutation = useMutation({
     mutationFn: async (currentFilters: LinesFilters) => {
@@ -58,14 +42,6 @@ export default function Lines() {
       const now = new Date();
       setLastFetched(now);
 
-      const cachePayload = {
-        lines: data,
-        lastFetched: now.toISOString(),
-        filters: currentFilters,
-      };
-
-      persistCachedLines(cachePayload);
-      queryClient.setQueryData(LAST_LINES_QUERY_KEY, cachePayload);
       setHasShownError(false);
 
       toast({
@@ -90,6 +66,8 @@ export default function Lines() {
   };
 
   const isLoading = fetchLinesMutation.isPending && lines.length === 0;
+
+  const validLastFetched = lastFetched && !isNaN(lastFetched.getTime()) ? lastFetched : null;
 
   useEffect(() => {
     if (!fetchLinesMutation.isError && hasShownError) {
@@ -162,9 +140,9 @@ export default function Lines() {
           </p>
         </div>
         <div className="flex items-center gap-3">
-          {lastFetched && (
+          {validLastFetched && (
             <span className="text-sm text-muted-foreground">
-              Last updated: {lastFetched.toLocaleTimeString()}
+              Last updated: {validLastFetched.toLocaleTimeString()}
             </span>
           )}
           <Button

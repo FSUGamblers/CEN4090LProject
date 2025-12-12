@@ -55,11 +55,11 @@ export default function HedgeCenter() {
   });
 
   const createBet = useMutation({
-    mutationFn: async () => {
+    mutationFn: async (payload: typeof initialBetForm) => {
       await apiRequest("POST", "/api/bets", {
-        ...betForm,
-        oddsAmerican: Number(betForm.oddsAmerican),
-        stake: Number(betForm.stake),
+        ...payload,
+        oddsAmerican: Number(payload.oddsAmerican),
+        stake: Number(payload.stake),
       });
     },
     onSuccess: () => {
@@ -96,10 +96,11 @@ export default function HedgeCenter() {
   });
 
   const handleSubmit = () => {
-    if (!betForm.sport || !betForm.selection || !betForm.sportsbook) {
+    // Keep the flow lightweight: only selection is required, everything else can fall back to defaults
+    if (!betForm.selection) {
       toast({
-        title: "Missing details",
-        description: "Sport, selection, and sportsbook are required.",
+        title: "Add a selection",
+        description: "Enter the side or player you backed.",
         variant: "destructive",
       });
       return;
@@ -108,25 +109,22 @@ export default function HedgeCenter() {
     const odds = Number(betForm.oddsAmerican);
     const stake = Number(betForm.stake);
 
-    if (!Number.isFinite(odds) || betForm.oddsAmerican === "") {
-      toast({
-        title: "Odds required",
-        description: "Enter valid American odds (e.g., -110).",
-        variant: "destructive",
-      });
-      return;
-    }
+    const payload = {
+      sport: betForm.sport || "Unknown",
+      sportsbook: betForm.sportsbook || "Unspecified",
+      marketType: betForm.marketType || "Moneyline",
+      league: betForm.league,
+      homeTeam: betForm.homeTeam,
+      awayTeam: betForm.awayTeam,
+      selection: betForm.selection,
+      oddsAmerican: Number.isFinite(odds) ? String(odds) : "-110",
+      stake: Number.isFinite(stake) ? String(stake) : "0",
+      status: betForm.status || "open",
+      notes: betForm.notes,
+    };
 
-    if (!Number.isFinite(stake) || stake <= 0) {
-      toast({
-        title: "Stake required",
-        description: "Enter a positive stake amount.",
-        variant: "destructive",
-      });
-      return;
-    }
-
-    createBet.mutate();
+    setBetForm(payload);
+    createBet.mutate(payload);
   };
 
   const startEditing = (bet: ManualBet) => {
