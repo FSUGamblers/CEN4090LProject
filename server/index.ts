@@ -45,7 +45,11 @@ app.use((req, res, next) => {
 
 (async () => {
   try {
-    await migrate(db, { migrationsFolder: path.resolve(process.cwd(), "migrations") });
+    if (db) {
+      await migrate(db, { migrationsFolder: path.resolve(process.cwd(), "migrations") });
+    } else {
+      console.warn("DATABASE_URL missing; starting in in-memory storage mode. Migrations skipped.");
+    }
   } catch (error) {
     console.error("Failed to run database migrations:", error);
     process.exit(1);
