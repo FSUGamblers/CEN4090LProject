@@ -1,7 +1,10 @@
 import 'dotenv/config';
 import express, { type Request, Response, NextFunction } from "express";
+import path from "path";
 import { registerRoutes } from "./routes";
 import { setupVite, serveStatic, log } from "./vite";
+import { migrate } from "drizzle-orm/node-postgres/migrator";
+import { db } from "./db";
 
 // Default NODE_ENV based on the npm script invoked so Windows shells
 // (which don't support inline environment assignment) still run correctly.
@@ -41,6 +44,13 @@ app.use((req, res, next) => {
 });
 
 (async () => {
+  try {
+    await migrate(db, { migrationsFolder: path.resolve(process.cwd(), "migrations") });
+  } catch (error) {
+    console.error("Failed to run database migrations:", error);
+    process.exit(1);
+  }
+
   const server = await registerRoutes(app);
 
   app.use((err: any, _req: Request, res: Response, _next: NextFunction) => {
