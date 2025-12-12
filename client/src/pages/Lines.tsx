@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -11,71 +11,91 @@ import { Skeleton } from "@/components/ui/skeleton";
 import { useToast } from "@/hooks/use-toast";
 import { LAST_LINES_QUERY_KEY, persistCachedLines, readCachedLines } from "@/lib/linesCache";
 import type { LineData, LinesFilters } from "@/types/lines";
-import { Search, Filter, Activity, Clock, TrendingUp, Building2, MapPin } from "lucide-react";
+import { Search, Filter, Activity, Clock, TrendingUp, Building2, MapPin, RefreshCcw } from "lucide-react";
 
 export default function Lines() {
   const { toast } = useToast();
   const queryClient = useQueryClient();
+  const [lines, setLines] = useState<LineData[]>([]);
   const [filters, setFilters] = useState<LinesFilters>({});
   const [hasShownError, setHasShownError] = useState(false);
+  const [lastFetched, setLastFetched] = useState<Date | null>(null);
 
   useEffect(() => {
     const cached = readCachedLines(filters);
-    if (!cached) return;
+    if (cached) {
+      setLines(cached.lines);
+      setLastFetched(cached.lastFetched ? new Date(cached.lastFetched) : null);
+      queryClient.setQueryData(LAST_LINES_QUERY_KEY, cached);
+      return;
+    }
 
-    queryClient.setQueryData(LAST_LINES_QUERY_KEY, cached);
+    // Clear stale lines when filters change and no matching cache is found
+    setLines([]);
+    setLastFetched(null);
   }, [filters, queryClient]);
 
-  // Fetch lines data
-  const { data: lines = [], isLoading, error } = useQuery<LineData[]>({
-    queryKey: ['/api/lines', filters],
-    queryFn: async () => {
+  const fetchLinesMutation = useMutation({
+    mutationFn: async (currentFilters: LinesFilters) => {
       const params = new URLSearchParams();
-      if (filters.sport) params.append('sport', filters.sport);
-      if (filters.state) params.append('state', filters.state);
-      if (filters.marketType) params.append('market_type', filters.marketType);
-      if (filters.live) params.append('live', filters.live);
-      if (filters.event) params.append('event', filters.event);
-      
+      if (currentFilters.sport) params.append('sport', currentFilters.sport);
+      if (currentFilters.state) params.append('state', currentFilters.state);
+      if (currentFilters.marketType) params.append('market_type', currentFilters.marketType);
+      if (currentFilters.live) params.append('live', currentFilters.live);
+      if (currentFilters.event) params.append('event', currentFilters.event);
+
       const response = await fetch(`/api/lines?${params.toString()}`, {
         credentials: 'include'
       });
       if (!response.ok) {
         throw new Error('Failed to fetch lines');
       }
-      return response.json();
+      const data = await response.json();
+      return { data, currentFilters };
     },
-    initialData: () => readCachedLines(filters)?.lines,
-    onSuccess: (data) => {
+    onSuccess: ({ data, currentFilters }) => {
+      setLines(data);
+      const now = new Date();
+      setLastFetched(now);
+
       const cachePayload = {
         lines: data,
-        lastFetched: new Date().toISOString(),
-        filters,
+        lastFetched: now.toISOString(),
+        filters: currentFilters,
       };
 
       persistCachedLines(cachePayload);
       queryClient.setQueryData(LAST_LINES_QUERY_KEY, cachePayload);
+      setHasShownError(false);
+
+      toast({
+        title: "Lines Updated",
+        description: `Fetched ${data.length} lines.`,
+      });
     },
-    refetchOnReconnect: false,
-    refetchOnWindowFocus: false,
+    onError: () => {
+      if (hasShownError) return;
+
+      toast({
+        title: "Error Loading Lines",
+        description: "Failed to load lines data. Please try again.",
+        variant: "destructive",
+      });
+      setHasShownError(true);
+    },
   });
 
-  useEffect(() => {
-    if (!error || hasShownError) return;
+  const handleFetchLines = () => {
+    fetchLinesMutation.mutate(filters);
+  };
 
-    toast({
-      title: "Error Loading Lines",
-      description: "Failed to load lines data. Please try again.",
-      variant: "destructive",
-    });
-    setHasShownError(true);
-  }, [error, hasShownError, toast]);
+  const isLoading = fetchLinesMutation.isPending && lines.length === 0;
 
   useEffect(() => {
-    if (!error && hasShownError) {
+    if (!fetchLinesMutation.isError && hasShownError) {
       setHasShownError(false);
     }
-  }, [error, hasShownError]);
+  }, [fetchLinesMutation.isError, hasShownError]);
 
   // Get unique values for filters
   const sports = Array.from(new Set(lines?.map(line => line.market.event.sport.code) || []));
@@ -141,12 +161,27 @@ export default function Lines() {
             View all stored odds data across events and sportsbooks
           </p>
         </div>
-        <div className="flex items-center gap-2">
-          {lines && (
+        <div className="flex items-center gap-3">
+          {lastFetched && (
             <span className="text-sm text-muted-foreground">
-              Last updated: {new Date(Math.max(...lines.map(line => new Date(line.timestamp).getTime()))).toLocaleTimeString()}
+              Last updated: {lastFetched.toLocaleTimeString()}
             </span>
           )}
+          <Button
+            onClick={handleFetchLines}
+            disabled={fetchLinesMutation.isPending}
+            data-testid="button-fetch-lines"
+          >
+            {fetchLinesMutation.isPending ? (
+              <>
+                <RefreshCcw className="w-4 h-4 mr-2 animate-spin" /> Fetching...
+              </>
+            ) : (
+              <>
+                <RefreshCcw className="w-4 h-4 mr-2" /> Fetch Lines
+              </>
+            )}
+          </Button>
         </div>
       </div>
 
